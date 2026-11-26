@@ -331,6 +331,11 @@ static uint16_t* s_gridBuf  = nullptr;   /* PSRAM：9 张缩略图连续存储 *
 static int       s_gridTop  = -1;       /* 缓存窗口首格对应的列表序号（3 的倍数，-1=无） */
 static uint32_t  s_gridGen  = 0;        /* 缓存对应列表代数 */
 static int       s_gridSelDrawn = -1;   /* 已画选中项（局部刷新用） */
+/* 待解码位图：bit k 对应窗口内第 k 格（0..8）。
+ * 快速滚动（长按连发）时行滚动只搬缓存、不解码，新进的那一行先显示
+ * 浅灰占位；主循环在"本轮没有按键输入"时调用 grid_flush_pending 补齐。
+ * 位图必须与缓存同步移位，否则会漏格或重复解码。 */
+static uint16_t  s_gridPendMask = 0;
 
 /* 区域平均降采样：320x240 暂存 → TH_WxTH_H（按实际解码后的 ow x oh 映射）
  * [观感修复] 旧版最近邻只取单像素：暗光照片的高增益噪点被抽样成彩色麻点，
@@ -447,6 +452,12 @@ static void grid_clear_sel(int listIdx)
     if (k < 0 || k >= GRID_CNT) return;
     int x = (k % GRID_COLS) * CELL_W + 1;
     int y = GRID_TOP + (k / GRID_COLS) * CELL_H + 1;
+    if (s_gridPendMask & (1u << k)) {
+        /* 该格还在等解码：回贴旧数据会闪出错位照片，保持浅灰占位即可 */
+        tft.fillRect(x, y, TH_W, TH_H, 0xDEFB);
+        tft.drawRect(x - 1, y - 1, TH_W + 2, TH_H + 2, TFT_WHITE);
+        return;
+    }
     tft.setSwapBytes(true);
     tft.pushImage(x, y, TH_W, TH_H, s_gridBuf + k * TH_W * TH_H);
     tft.setSwapBytes(false);
@@ -480,6 +491,42 @@ static void grid_draw_bottombar(void)
     tft.print("TOP/DN move   CAM open   MID back");
 }
 
+/* =====================================================================
+ * 补齐延迟解码的格子（快速滚动时滚动只搬缓存、不解码）
+ *   s_gridPendMask 的每一位对应窗口内第 k 格，置位 = 数据还没解码。
+ *   主循环确认"本轮没有任何按键输入"后才调用 —— 长按连发期间一直被
+ *   跳过，所以按住可以连续滑，松手后再集中补齐，不会被解码阻塞。
+ * =================================================================== */
+static void grid_flush_pending(void)
+{
+    if (!s_gridPendMask || s_gridTop < 0 || !s_gridBuf || !s_nextBuf) return;
+    uint16_t mask = s_gridPendMask;
+    s_gridPendMask = 0;
+    int done = 0;
+    uint32_t t0 = millis();
+    tft.setSwapBytes(true);
+    for (int k = 0; k < GRID_CNT; ++k) {
+        if (!(mask & (1u << k))) continue;
+        int cx = (k % GRID_COLS) * CELL_W + 1;
+        int cy = GRID_TOP + (k / GRID_COLS) * CELL_H + 1;
+        if (s_gridTop + k >= s_count) {
+            tft.fillRect(cx, cy, TH_W, TH_H, TFT_WHITE);
+            continue;
+        }
+        grid_load_thumb(s_gridTop, k);
+        tft.pushImage(cx, cy, TH_W, TH_H, s_gridBuf + k * TH_W * TH_H);
+        ++done;
+    }
+    tft.setSwapBytes(false);
+    /* s_nextBuf 被借用为解码暂存：作废全屏预解码缓存，防止全屏误命中 */
+    s_nextIdx = -1;
+    s_prefetchReq    = false;
+    s_prefetchBusy   = false;
+    s_prefetchTarget = -1;
+    Serial.printf("[GAL] 补齐 %d 格缩略图（%ums）\n", done,
+                  (unsigned)(millis() - t0));
+}
+
 /* 九宫格绘制（连续滚动窗口）：
  *   窗口 = s_gridTop 起的 9 格；选中项越界时窗口按"整行"滚动一行，
  *   重叠的 6 张缩略图直接复用（memmove），只解码新进的一行 → 流畅不闪 */
@@ -509,16 +556,32 @@ static void galleryGridPage(void)
                        delta > GRID_COLS || delta < -GRID_COLS);
 
     if (hasBuf && !fullRedraw && delta != 0) {
-        /* ---- 2a. 整行滚动：复用重叠 6 张，只解码新进的那一行 ---- */
-        int rows = delta / GRID_COLS;              /* ±1 */
-        int cellBytes = TH_W * TH_H * 2;
-        if (rows > 0) {                            /* 下移一行：3..8 → 0..5 */
-            memmove(s_gridBuf, s_gridBuf + 3 * cellBytes, 6 * cellBytes);
-            for (int k = 6; k < 9; ++k) grid_load_thumb(newTop, k);
-        } else {                                   /* 上移一行：0..5 → 3..8 */
-            memmove(s_gridBuf + 3 * cellBytes, s_gridBuf, 6 * cellBytes);
-            for (int k = 0; k < 3; ++k) grid_load_thumb(newTop, k);
+        /* ---- 2a. 整行滚动：复用重叠 6 张，只解码新进的那一行 ----
+         * [花屏根因修复 2026-11-26] 旧写法
+         *   memmove(s_gridBuf, s_gridBuf + 3 * cellBytes, 6 * cellBytes)
+         * 把"字节数"当成了元素偏移：s_gridBuf 是 uint16_t*，指针 +N 前进
+         * N 个 2 字节元素，于是 s_gridBuf + 3*13872 实际跨了 6 格。结果：
+         *   目的 0..5 格 ← 源 6..11 格（第 9~11 格已越出 9 格缓冲，读到
+         *   相邻 PSRAM 分配 = 未初始化垃圾）。
+         * 现象完全对应：新解的那一行被复制到第 0 行 → 显示正常；中间行
+         * （第 3~5 格）装的是越界垃圾 → 彩色噪点花屏。上移分支更糟，目的
+         * 地址写到第 6~11 格，会直接踩坏缓冲区后面的内存。
+         * 现统一换算成 uint8_t 字节基址 + 行字节数，彻底杜绝类型混用。 */
+        const int rows      = delta / GRID_COLS;                       /* ±1 */
+        const int cellBytes = TH_W * TH_H * (int)sizeof(uint16_t);
+        const int rowBytes  = GRID_COLS * cellBytes;                   /* 一整行 3 格 */
+        uint8_t*  base      = (uint8_t*)s_gridBuf;
+        /* 位图跟着数据一起移位；新进的那一行标记为"待解码"，先占位 */
+        if (rows > 0) {                            /* 下移一行：第 1~2 行 → 第 0~1 行 */
+            memmove(base, base + rowBytes, (GRID_ROWS - 1) * rowBytes);
+            s_gridPendMask >>= GRID_COLS;
+            s_gridPendMask |= (uint16_t)(0x7u << (GRID_CNT - GRID_COLS));
+        } else {                                   /* 上移一行：第 0~1 行 → 第 1~2 行 */
+            memmove(base + rowBytes, base, (GRID_ROWS - 1) * rowBytes);
+            s_gridPendMask <<= GRID_COLS;
+            s_gridPendMask |= 0x7u;
         }
+        s_gridPendMask &= (uint16_t)((1u << GRID_CNT) - 1);   /* 只保留窗口内 9 位 */
         s_gridTop = newTop;
         s_gridSelDrawn = -1;
         /* s_nextBuf 被借用为缩略图解码暂存：作废预解码缓存，防止全屏误命中 */
@@ -534,10 +597,12 @@ static void galleryGridPage(void)
         for (int k = 0; k < GRID_CNT; ++k) {
             int cx = (k % GRID_COLS) * CELL_W + 1;
             int cy = GRID_TOP + (k / GRID_COLS) * CELL_H + 1;
-            if (newTop + k < s_count)
-                tft.pushImage(cx, cy, TH_W, TH_H, s_gridBuf + k * TH_W * TH_H);
-            else
+            if (newTop + k >= s_count)
                 tft.fillRect(cx, cy, TH_W, TH_H, TFT_WHITE);
+            else if (s_gridPendMask & (1u << k))
+                tft.fillRect(cx, cy, TH_W, TH_H, 0xDEFB);   /* 待解码：浅灰占位 */
+            else
+                tft.pushImage(cx, cy, TH_W, TH_H, s_gridBuf + k * TH_W * TH_H);
         }
         tft.setSwapBytes(false);
         grid_draw_topbar();
@@ -574,6 +639,7 @@ static void galleryGridPage(void)
         s_prefetchTarget = -1;
         s_gridTop = newTop;
         s_gridGen = s_listGen;
+        s_gridPendMask = 0;            /* 整页已同步解码完毕，撤销待解码位图 */
     }
 
     tft.fillScreen(TFT_WHITE);
@@ -975,6 +1041,8 @@ void ui_gallery_loop(void)
     g_galleryOpenReq = false;
     g_btTOPstate = 0;      /* 丢弃进相册途中误存的按键标志 */
     g_btDownstate = 0;
+    g_navBurstUp = g_navBurstDown = 0;   /* 清掉进相册前残留的连发步数 */
+    s_gridPendMask = 0;                   /* 新列表：无待解码格 */
     /* [叠加态修复] 缓存命中跳过重绘的判断没考虑"屏幕被桌面/相机覆盖过"：
      * 第二次进相册时页码没变 → 只画选中框，缩略图全不画 → 主界面透出来。
      * 强制失效页缓存，进相册必整页重绘 */
@@ -1005,19 +1073,30 @@ void ui_gallery_loop(void)
             /* ---------- 九宫格连续滚动列表 ----------
              * 逐格移动；走到可视窗口最右下一格再往下 → 窗口整行上滚，
              * 不是整页跳转（用户要求）。到头/到尾不循环，避免视觉跳变 */
-            if (g_btDownstate == 1) {          /* 下一格 */
-                g_btDownstate = 0;
-                if (s_count > 0 && s_cur < s_count - 1) {
-                    s_cur++;
-                    galleryGridPage();
-                }
+            /* ---- 按键输入：单击 1 格 + 长按连发 ----
+             * keyTask 在相册内长按上下键时每 130ms 累加一次步数，这里一次
+             * 消费完；必须"逐格"调 galleryGridPage —— 一次跳多格会让
+             * delta > GRID_COLS 掉进整页重建（解码 9 张，卡 2s+） */
+            int burst = (int)g_navBurstDown - (int)g_navBurstUp;
+            g_navBurstDown = 0;
+            g_navBurstUp   = 0;
+            if (burst == 0) {
+                if (g_btDownstate == 1) { g_btDownstate = 0; burst = 1; }
+                else if (g_btTOPstate == 1) { g_btTOPstate = 0; burst = -1; }
             }
-            if (g_btTOPstate == 1) {           /* 上一格 */
-                g_btTOPstate = 0;
-                if (s_count > 0 && s_cur > 0) {
-                    s_cur--;
-                    galleryGridPage();
+            if (burst != 0) {
+                int dir = (burst > 0) ? 1 : -1;
+                int n   = (burst > 0) ? burst : -burst;
+                for (int i = 0; i < n && s_count > 0; ++i) {
+                    int nv = s_cur + dir;
+                    if (nv < 0 || nv >= s_count) break;
+                    s_cur = nv;
+                    galleryGridPage();          /* 窗口内=刷框；跨行=行滚动 */
                 }
+                g_galleryOpenReq = false;       /* 连发途中丢弃打开请求，防误触 */
+            } else if (s_gridPendMask) {
+                /* 本轮没有任何输入：补齐滚动留下的待解码格（连发结束/松手） */
+                grid_flush_pending();
             }
             if (g_galleryOpenReq) {            /* CAM 单击：打开选中照片 */
                 g_galleryOpenReq = 0;

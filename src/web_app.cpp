@@ -584,6 +584,18 @@ static void handleClearAll() {
 }
 
 /* --------------------- 备忘录：/notes.txt 每行一条 --------------------- */
+/* [首次写入修复] FILE_APPEND 打开不存在的文件时，ESP32 SD/vfs 不会创建，
+ * 直接报 "does not exist, no permits for creation" —— 设备第一次用备忘
+ * （或删空后）Web 添加必定失败。这里先显式建空文件；注意不能用 FILE_WRITE
+ * 代替追加（它是截断模式，会把已有备忘清空） */
+static void noteEnsureFile(void)
+{
+    if (SD.exists("/notes.txt")) return;
+    File f = SD.open("/notes.txt", FILE_WRITE);
+    if (f) f.close();
+    Serial.println("[WEB] /notes.txt 不存在，已创建空文件");
+}
+
 static void handleNotes() {
     String html = "<!DOCTYPE html><html lang='zh'><head><meta charset='utf-8'>"
                   "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -628,6 +640,7 @@ static void handleNotes() {
                   "<div style='margin-top:10px'><button class='pri' "
                   "onclick=\"var v=document.getElementById('t').value.trim();"
                   "if(v)location.href='/noteadd?text='+encodeURIComponent(v)\">+ 添加</button></div></div>";
+    noteEnsureFile();                    /* 首次打开也把空文件建好，读不再报错 */
     File f = SD.open("/notes.txt", FILE_READ);
     int i = 0;
     if (f) {
@@ -658,6 +671,7 @@ static void handleNoteAdd() {
     if (t.length()) {
         t.replace("\r", "");
         t.replace("\n", " ");
+        noteEnsureFile();                /* 关键：先建文件再追加，否则首次添加静默失败 */
         File f = SD.open("/notes.txt", FILE_APPEND);
         if (f) { f.println(t); f.close(); }
     }

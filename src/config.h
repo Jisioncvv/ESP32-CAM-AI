@@ -87,6 +87,9 @@ extern volatile int  g_appSel;       /* 桌面图标选择序号 0..4 */
 /* --------------------- 按键/显示状态（官方同款全局标志） --------------------- */
 extern volatile int g_btTOPstate;    /* TOP 单击置 1，由相机/相册 App 循环消费清 0 */
 extern volatile int g_btDownstate;   /* DOWN 单击置 1，由相机/相册 App 循环消费清 0 */
+/* 相册长按连发步数（keyTask 每 130ms 累加，相册主循环一次消费完） */
+extern volatile uint8_t g_navBurstUp;
+extern volatile uint8_t g_navBurstDown;
 
 /* 相册子状态（相册 App 循环维护，keyTask 的 CAM 键按此分派） */
 extern volatile int  g_galleryView;     /* 0=列表菜单, 1=全屏查看 */

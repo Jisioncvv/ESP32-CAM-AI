@@ -29,6 +29,10 @@ TaskHandle_t        g_photoWriteTaskHandle = nullptr;
 /* --------------------- 官方同款全局按键/显示状态 --------------------- */
 volatile int g_btTOPstate   = 0;   /* 官方 btTOPstate */
 volatile int g_btDownstate  = 0;   /* 官方 btDownstate */
+/* 相册长按连发步数：keyTask 按住期间每 REPEAT_PERIOD_MS 累加 1，
+ * 相册主循环一次消费完（逐格滚动）。与单击标志分开，避免互相覆盖 */
+volatile uint8_t g_navBurstUp   = 0;
+volatile uint8_t g_navBurstDown = 0;
 volatile int  g_galleryView     = 0;   /* 0=相册列表 1=全屏查看 */
 volatile bool g_galleryOpenReq  = false;
 volatile bool g_galleryDeleteReq = false;   /* CAM 双击：全屏态删除当前照片 */
@@ -95,6 +99,7 @@ void cameraTask(void* arg)
 #define DOUBLE_CLICK_THRESHOLD 400  /* 双击最大间隔 ms */
 #define LONG_PRESS_THRESHOLD   800  /* 长按判断阈值 ms */
 #define DEBOUNCE_DELAY         100  /* 去抖动时间 ms */
+#define REPEAT_PERIOD_MS       130  /* 长按连发间隔（相册快速翻页） */
 
 enum KeyState { IDLE, PRESSED, WAIT_SECOND_PRESS, LONG_PRESSED };
 
@@ -105,14 +110,26 @@ struct KeyInfo {
     unsigned long pressStart;
     unsigned long lastPress;
     bool skipNextSingle;
+    bool repeatable;          /* 长按是否连发（声明能力，仅相册内生效） */
+    bool repeatActive;        /* 本次长按实际走了连发（按下瞬间锁定） */
+    unsigned long lastRepeat; /* 上次连发时刻 */
 };
 
 static KeyInfo keys[4] = {
-    {PIN_KEY_CAM,  false, IDLE, 0, 0, true},   /* 拍照 */
-    {PIN_KEY_TOP,  false, IDLE, 0, 0, true},   /* 上键 */
-    {PIN_KEY_MID,  false, IDLE, 0, 0, true},   /* 中键 */
-    {PIN_KEY_DOWN, false, IDLE, 0, 0, true},   /* 下键 */
+    /* pin            flag  state pressStart lastPress skip  repeat actv lastRepeat */
+    {PIN_KEY_CAM,  false, IDLE, 0, 0, true,  false, false, 0},   /* 拍照：松手生效 */
+    {PIN_KEY_TOP,  false, IDLE, 0, 0, true,  true,  false, 0},   /* 上键：相册内连发 */
+    {PIN_KEY_MID,  false, IDLE, 0, 0, true,  false, false, 0},   /* 中键：松手生效 */
+    {PIN_KEY_DOWN, false, IDLE, 0, 0, true,  true,  false, 0},   /* 下键：相册内连发 */
 };
+
+/* 连发白名单：只在相册浏览里启用。
+ * TOP 长按在桌面/相机 App 是 WiFi 总开关、MID 长按是重启、CAM 长按是
+ * 闪光灯拍照 —— 这些绝不能变成每 130ms 触发一次 */
+static inline bool keyRepeatAllowed(void)
+{
+    return g_appMode == MODE_GALLERY;
+}
 
 /* 官方 IRAM 中断回调：置标志 */
 static void IRAM_ATTR onKeyCamPress()  { keys[0].flag = true; }
@@ -230,18 +247,39 @@ static void midSingleClick() {
 }
 static void topDoubleClick()  { if (g_appMode == MODE_CAMERA) g_dispReqRotate = true; }  /* 预览旋转 180° */
 static void topLongPress()
-{   /* [主界面 WiFi 总开关] 像手机：开=STA 自动连记忆热点（后台任务，不卡按键），
+{
+    /* 相册内：长按 = 向上连续翻页（每 REPEAT_PERIOD_MS 累加 1 步，
+     * 由相册主循环逐格消费，跨行时走缓存滚动而非整页重建） */
+    if (g_appMode == MODE_GALLERY) {
+        if (g_navBurstUp < 24) g_navBurstUp++;
+        return;
+    }
+    /* [主界面 WiFi 总开关] 像手机：开=STA 自动连记忆热点（后台任务，不卡按键），
      * 关=WiFi 全关省电。桌面与相机 App 均可用 */
     web_app_wifi_user_toggle();
+}
+static void downLongPress()
+{
+    if (g_appMode == MODE_GALLERY) {
+        if (g_navBurstDown < 24) g_navBurstDown++;
+    }
 }
 static void midLongPress()    { ESP.restart(); }            /* 系统重启（卡死自救） */
 static void downDoubleClick() { if (g_appMode == MODE_CAMERA) camera_app_set_gray(-1); }  /* 黑白/彩色切换 */
 
-/* 官方 handleKey 状态机 1:1 */
+/* 官方 handleKey 状态机（增加"可连发长按"与"相册免双击等待"两条通路）
+ *   连发键（相册上下）：超过长按阈值立即执行第一次，按住期间每
+ *     REPEAT_PERIOD_MS 再执行一次，松手即停；
+ *   非连发键（CAM/MID/桌面与相机 App 的 TOP）：保持"松手生效"，
+ *     避免按住误触（闪光灯拍照、重启、WiFi 开关）。 */
 static void handleKey(KeyInfo& key, const char* name,
                       void (*singleClick)(), void (*doubleClick)(), void (*longPress)())
 {
     unsigned long now = millis();
+    /* 连发能力在"按下瞬间"锁定：否则按住上键的途中用中键退出相册，
+     * canRepeat 会从 true 翻成 false，松手时误走"松手生效"分支 →
+     * 在桌面触发 TOP 长按 = WiFi 总开关（不应发生）。 */
+    bool canRepeat = key.repeatActive;
 
     if (key.flag) {
         key.flag = false;
@@ -250,6 +288,8 @@ static void handleKey(KeyInfo& key, const char* name,
             key.pressStart = now;
             key.state = PRESSED;
             key.skipNextSingle = false;
+            /* 按下瞬间锁定：本键这次按键是否允许连发（相册内上下键才允许） */
+            key.repeatActive = key.repeatable && keyRepeatAllowed();
         } else if (key.state == WAIT_SECOND_PRESS &&
                    (now - key.lastPress) < DOUBLE_CLICK_THRESHOLD) {
             if (doubleClick) doubleClick();
@@ -259,22 +299,47 @@ static void handleKey(KeyInfo& key, const char* name,
         }
     }
 
-    /* 长按触发改为"松手生效"：按住超过阈值只标记 LONG_PRESSED，
-     * 松开瞬间才执行回调——避免按住过程中误触发（CAM 长按闪光灯体验差） */
     if (key.state == PRESSED && (now - key.pressStart > LONG_PRESS_THRESHOLD)) {
         key.state = LONG_PRESSED;
         key.skipNextSingle = true;
+        if (canRepeat) {
+            /* 连发首步立刻执行，体感"按住就开始走" */
+            key.lastRepeat = now;
+            if (longPress) longPress();
+            Serial.printf("[KEY] %s 长按（连发开始）\n", name);
+        }
+    }
+
+    /* 按住不放：周期重发。松手后下面的分支会清状态，连发自然停止 */
+    if (key.state == LONG_PRESSED && canRepeat && digitalRead(key.pin) == LOW) {
+        if (now - key.lastRepeat >= REPEAT_PERIOD_MS) {
+            key.lastRepeat = now;
+            if (longPress) longPress();
+        }
     }
 
     if ((key.state == PRESSED || key.state == LONG_PRESSED) &&
         digitalRead(key.pin) == HIGH) {
         if (key.state == PRESSED) {
-            key.lastPress = now;
-            key.state = WAIT_SECOND_PRESS;
+            /* [翻页延迟修复] 相册上下键没有双击语义，松手立即执行单击，
+             * 不再等 400ms 双击窗口 —— 原来每翻一格都要白等 400ms，
+             * 这是"一个一个挪很慢"的主要体感来源之一 */
+            if (canRepeat) {
+                if (singleClick) singleClick();
+                Serial.printf("[KEY] %s 单击（相册免双击等待）\n", name);
+                key.state = IDLE;
+            } else {
+                key.lastPress = now;
+                key.state = WAIT_SECOND_PRESS;
+            }
         } else {
-            /* 长按后松开：此刻执行长按回调 */
-            if (longPress) longPress();
-            Serial.printf("[KEY] %s 长按\n", name);
+            /* 长按后松开：非连发键此刻才执行回调（连发键已在按住期间执行） */
+            if (!canRepeat) {
+                if (longPress) longPress();
+                Serial.printf("[KEY] %s 长按\n", name);
+            } else {
+                Serial.printf("[KEY] %s 连发结束\n", name);
+            }
             key.state = IDLE;
         }
     }
@@ -512,7 +577,7 @@ void keyTask(void* arg)
         handleKey(keys[0], "拍照键", camSingleClick, camDoubleClick, camLongPress);
         handleKey(keys[1], "上键",   topSingleClick, topDoubleClick, topLongPress);
         handleKey(keys[2], "中键",   midSingleClick, nullptr, midLongPress);
-        handleKey(keys[3], "下键",   downSingleClick, downDoubleClick, nullptr);
+        handleKey(keys[3], "下键",   downSingleClick, downDoubleClick, downLongPress);
         serialCmdPoll();             /* USB 串口调试命令 */
 
         vTaskDelay(pdMS_TO_TICKS(10));   /* 官方 10ms 轮询 */
