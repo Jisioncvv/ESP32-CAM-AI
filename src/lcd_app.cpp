@@ -17,6 +17,7 @@
  */
 #include "config.h"
 #include "lcd_app.h"
+#include "theme.h"
 #include "camera_app.h"
 #include "sd_app.h"
 #include "ui_app.h"
@@ -327,10 +328,10 @@ static uint8_t pickJpgScale(const String& path)
 #define GRID_ROWS 3
 #define GRID_CNT  (GRID_COLS * GRID_ROWS)
 #define TH_W      102     /* 缩略图尺寸 */
-#define TH_H      68
+#define TH_H      60
 #define CELL_W    106     /* 单元格尺寸（含边距） */
-#define CELL_H    70
-#define GRID_TOP  21      /* 网格起始 y（顶栏下方） */
+#define CELL_H    63
+#define GRID_TOP  32      /* 网格起始 y（30px 顶栏下方） */
 
 static uint16_t* s_gridBuf  = nullptr;   /* PSRAM：9 张缩略图连续存储 */
 static int       s_gridTop  = -1;       /* 缓存窗口首格对应的列表序号（3 的倍数，-1=无） */
@@ -459,45 +460,46 @@ static void grid_clear_sel(int listIdx)
     int y = GRID_TOP + (k / GRID_COLS) * CELL_H + 1;
     if (s_gridPendMask & (1u << k)) {
         /* 该格还在等解码：回贴旧数据会闪出错位照片，保持浅灰占位即可 */
-        tft.fillRect(x, y, TH_W, TH_H, 0xDEFB);
-        tft.drawRect(x - 1, y - 1, TH_W + 2, TH_H + 2, TFT_WHITE);
+        tft.fillRect(x, y, TH_W, TH_H, g_th->surface2);
+        tft.drawRect(x - 1, y - 1, TH_W + 2, TH_H + 2, g_th->bg);
         return;
     }
     tft.setSwapBytes(true);
     tft.pushImage(x, y, TH_W, TH_H, s_gridBuf + k * TH_W * TH_H);
     tft.setSwapBytes(false);
-    tft.drawRect(x - 1, y - 1, TH_W + 2, TH_H + 2, TFT_WHITE);
+    tft.drawRect(x - 1, y - 1, TH_W + 2, TH_H + 2, g_th->bg);
 }
 
-/* 顶栏（统一风格：白底 + 深蓝标题 + 细分割线）与底栏提示 */
+/* 顶栏 / 底栏（与 theme.h 的 ui_header/ui_footer 同一几何：30px / 20px） */
 static void grid_draw_topbar(void)
 {
-    tft.fillRect(0, 0, 320, 20, TFT_WHITE);
-    tft.drawFastHLine(0, 20, 320, 0xC618);
+    tft.fillRect(0, 0, 320, 30, g_th->header);
+    tft.drawFastHLine(0, 29, 320, g_th->line);
     tft.setTextDatum(TL_DATUM);
     tft.setTextFont(1);        /* 钉死 8px 字模，防止继承上个 App 的大字号 */
     tft.setTextSize(1);
-    tft.setTextColor(TFT_NAVY, TFT_WHITE);
-    tft.setCursor(6, 6);
-    if (s_count > 0) {
-        char hdr[40];
-        snprintf(hdr, sizeof(hdr), "PHOTOS  %d / %d", s_cur + 1, s_count);
-        tft.print(hdr);
-    } else {
-        tft.print("PHOTOS  0 / 0");
-    }
+    tft.setTextColor(g_th->text, g_th->header);
+    tft.setCursor(12, 11);
+    tft.print("Photos");
+    tft.setTextDatum(TR_DATUM);
+    tft.setTextColor(g_th->muted, g_th->header);
+    char hdr[24];
+    if (s_count > 0) snprintf(hdr, sizeof(hdr), "%d / %d", s_cur + 1, s_count);
+    else             snprintf(hdr, sizeof(hdr), "0 / 0");
+    tft.drawString(hdr, 308, 11);
+    tft.setTextDatum(TL_DATUM);
 }
 
 static void grid_draw_bottombar(void)
 {
-    tft.fillRect(0, 232, 320, 8, TFT_WHITE);
-    tft.drawFastHLine(0, 232, 320, 0xC618);
-    tft.setTextDatum(TL_DATUM);
+    tft.fillRect(0, 220, 320, 20, g_th->header);
+    tft.drawFastHLine(0, 220, 320, g_th->line);
+    tft.setTextDatum(MC_DATUM);
     tft.setTextFont(1);
     tft.setTextSize(1);
-    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
-    tft.setCursor(6, 233);
-    tft.print("TOP/DN move   CAM open   MID back");
+    tft.setTextColor(g_th->muted, g_th->header);
+    tft.drawString("TOP/DN move   CAM open   MID back", 160, 230);
+    tft.setTextDatum(TL_DATUM);
 }
 
 /* =====================================================================
@@ -519,7 +521,7 @@ static void grid_flush_pending(void)
         int cx = (k % GRID_COLS) * CELL_W + 1;
         int cy = GRID_TOP + (k / GRID_COLS) * CELL_H + 1;
         if (s_gridTop + k >= s_count) {
-            tft.fillRect(cx, cy, TH_W, TH_H, TFT_WHITE);
+            tft.fillRect(cx, cy, TH_W, TH_H, g_th->bg);
             continue;
         }
         grid_load_thumb(s_gridTop, k);
@@ -601,21 +603,21 @@ static void galleryGridPage(void)
         /* 只重贴 9 张缩略图（不解码），几乎瞬时 */
         /* [残影修复] 选中框描边画在格子间的白槽里，pushImage 只覆盖图片区域，
          * 必须先整块涂白，否则旧选中框会留在原格边缘形成错位残影 */
-        tft.fillRect(0, GRID_TOP, 320, GRID_ROWS * CELL_H, TFT_WHITE);
+        tft.fillRect(0, 30, 320, 190, g_th->bg);   /* 顶栏下沿到页脚之间的整块 */
         tft.setSwapBytes(true);
         for (int k = 0; k < GRID_CNT; ++k) {
             int cx = (k % GRID_COLS) * CELL_W + 1;
             int cy = GRID_TOP + (k / GRID_COLS) * CELL_H + 1;
             if (newTop + k >= s_count)
-                tft.fillRect(cx, cy, TH_W, TH_H, TFT_WHITE);
+                tft.fillRect(cx, cy, TH_W, TH_H, g_th->bg);
             else if (s_gridPendMask & (1u << k))
-                tft.fillRect(cx, cy, TH_W, TH_H, 0xDEFB);   /* 待解码：浅灰占位 */
+                tft.fillRect(cx, cy, TH_W, TH_H, g_th->surface2);   /* 待解码：占位块 */
             else
                 tft.pushImage(cx, cy, TH_W, TH_H, s_gridBuf + k * TH_W * TH_H);
         }
         tft.setSwapBytes(false);
         grid_draw_topbar();
-        grid_draw_sel(s_cur, 0x33DE);
+        grid_draw_sel(s_cur, g_th->accent);
         grid_draw_bottombar();
         s_gridSelDrawn = s_cur;
         return;
@@ -625,7 +627,7 @@ static void galleryGridPage(void)
         if (s_gridSelDrawn != s_cur && hasBuf) {
             /* ---- 2b. 窗口内移动：只刷选中框 + 顶栏（秒刷） ---- */
             grid_clear_sel(s_gridSelDrawn);
-            grid_draw_sel(s_cur, 0x33DE);
+            grid_draw_sel(s_cur, g_th->accent);
             grid_draw_topbar();
             grid_draw_bottombar();
             s_gridSelDrawn = s_cur;
@@ -635,11 +637,13 @@ static void galleryGridPage(void)
 
     /* ---- 3. 整页重建（首次进入 / 大跳 / 列表变化） ---- */
     if (hasBuf) {
-        tft.fillScreen(TFT_WHITE);
+        tft.fillScreen(g_th->bg);
         grid_draw_topbar();
+        tft.setTextDatum(TL_DATUM);
+        tft.setTextFont(1);
         tft.setTextSize(1);
-        tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
-        tft.setCursor(6, 30);
+        tft.setTextColor(g_th->muted, g_th->bg);
+        tft.setCursor(12, 60);
         tft.print("Loading thumbnails...");
         for (int k = 0; k < GRID_CNT; ++k) grid_load_thumb(newTop, k);
         s_nextIdx = -1;                /* s_nextBuf 被借用为解码暂存：复位预解码 */
@@ -651,15 +655,16 @@ static void galleryGridPage(void)
         s_gridPendMask = 0;            /* 整页已同步解码完毕，撤销待解码位图 */
     }
 
-    tft.fillScreen(TFT_WHITE);
+    tft.fillScreen(g_th->bg);
     grid_draw_topbar();
     if (s_count == 0) {
         tft.setTextDatum(MC_DATUM);
-        tft.setTextSize(2);
-        tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
-        tft.drawString("No photos", 160, 108);
+        tft.setTextFont(2);
         tft.setTextSize(1);
-        tft.drawString("Take one with CAM in preview", 160, 134);
+        tft.setTextColor(g_th->muted, g_th->bg);
+        tft.drawString("No photos", 160, 108);
+        tft.setTextFont(1);
+        tft.drawString("Take one with CAM in preview", 160, 132);
         tft.setTextDatum(TL_DATUM);
     } else if (hasBuf) {
         tft.setSwapBytes(true);        /* TJpgDec 输出小端 RGB565 */
@@ -674,14 +679,16 @@ static void galleryGridPage(void)
         for (int k = 0; k < GRID_CNT && newTop + k < s_count; ++k) {
             int cx = (k % GRID_COLS) * CELL_W + 1;
             int cy = GRID_TOP + (k / GRID_COLS) * CELL_H + 1;
-            tft.fillRect(cx, cy, TH_W, TH_H, 0xDEFB);
+            tft.fillRect(cx, cy, TH_W, TH_H, g_th->surface2);
             tft.setTextDatum(MC_DATUM);
-            tft.setTextColor(TFT_DARKGREY, 0xDEFB);
+            tft.setTextFont(1);
+            tft.setTextSize(1);
+            tft.setTextColor(g_th->muted, g_th->surface2);
             tft.drawCentreString(s_names[newTop + k], cx + TH_W / 2, cy + TH_H / 2, 2);
             tft.setTextDatum(TL_DATUM);
         }
     }
-    grid_draw_sel(s_cur, 0x33DE);
+    grid_draw_sel(s_cur, g_th->accent);
     grid_draw_bottombar();
     s_gridSelDrawn = s_cur;
 }
@@ -765,6 +772,46 @@ void lcd_app_gallery_debug_shot(void)
         Serial.flush();
         vTaskDelay(1);
         sent += n;
+    }
+    Serial.println("ENDB64");
+}
+
+/* 诊断：把复用 Sprite（游戏/设置/备忘 的整帧缓冲）RLE+Base64 回传 */
+void lcd_app_dump_frame(void)
+{
+    if (!s_sprReady || !s_previewBuf) { Serial.println("IMGERR no-spr"); return; }
+    const int N = 320 * 240;
+    static uint8_t* rle = nullptr;
+    if (!rle) rle = (uint8_t*)heap_caps_malloc(N * 4 + 16, MALLOC_CAP_SPIRAM);
+    if (!rle) { Serial.println("IMGERR alloc"); return; }
+
+    size_t rc = 0;
+    int i = 0;
+    while (i < N && rc + 4 <= (size_t)(N * 4)) {
+        uint16_t c = s_previewBuf[i];
+        uint32_t run = 1;
+        while (i + (int)run < N && s_previewBuf[i + run] == c && run < 0xFFFF) run++;
+        rle[rc++] = c & 0xFF; rle[rc++] = c >> 8;
+        rle[rc++] = run & 0xFF; rle[rc++] = (run >> 8) & 0xFF;
+        i += run;
+    }
+    Serial.printf("B64 %u\n", (unsigned)rc);
+    /* [分块必须按 3 字节对齐] 每个分块单独 base64 编码会带 "=" 填充，
+     * 拼接起来就是非法流（上位机 b64decode 会在第一个 = 处截断，只解出 1KB）。
+     * 1002 = 3 * 334，除最后一块外都不产生填充 */
+    static uint8_t rbuf[1002];
+    static char    bbuf[1400];
+    size_t sent = 0;
+    while (sent < rc) {
+        size_t n = (sent + sizeof(rbuf) > rc) ? (rc - sent) : sizeof(rbuf);
+        memcpy(rbuf, rle + sent, n);
+        size_t olen = 0;
+        if (mbedtls_base64_encode((unsigned char*)bbuf, sizeof(bbuf), &olen, rbuf, n) != 0) break;
+        bbuf[olen] = '\0';
+        Serial.println(bbuf);
+        Serial.flush();
+        sent += n;
+        vTaskDelay(1);
     }
     Serial.println("ENDB64");
 }

@@ -16,6 +16,7 @@
 #include "rtos_app.h"
 #include "web_app.h"
 #include "ui_app.h"
+#include "theme.h"
 
 void setup()
 {
@@ -24,6 +25,8 @@ void setup()
     delay(300);
     Serial.println();
     Serial.println("================ ESP32-S3 Camera System 启动 ================");
+
+    theme_init();       /* 主题（深色/浅色）从 NVS 读回，后面所有界面都用它 */
 
     /* 先点亮屏幕，后续状态直接显示在屏上 */
     lcd_app_init();

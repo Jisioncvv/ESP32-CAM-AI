@@ -38,6 +38,11 @@ void lcd_app_mark_gallery_dirty(void);
 void lcd_app_gallery_debug_dump(void);
 void lcd_app_gallery_debug_shot(void);
 
+/* ---- 诊断：把当前复用 Sprite（游戏/设置/备忘 整帧缓冲）回传成 PNG 数据 ----
+ * 协议同桌面截图：B64 <len> → base64(RLE: 颜色lo 颜色hi 步数lo 步数hi) → ENDB64
+ * 注意：Sprite 内存是按 ST7789 的大端序存的，上位机解码时需字节交换才是人眼所见 */
+void lcd_app_dump_frame(void);
+
 /* ---- 相机 App 主循环（原 displayTask 预览分支，camera App 模式专用） ----
  * 进入后阻塞运行直到 g_appExitReq：释放采集任务 + 摄像头 deinit 后返回 */
 void ui_camera_loop(void);

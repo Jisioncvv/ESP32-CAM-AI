@@ -15,6 +15,7 @@
 #include "web_app.h"
 #include "sd_app.h"
 #include "ui_app.h"
+#include "game_app.h"
 #include <SD.h>
 #include <WiFi.h>
 
@@ -123,12 +124,21 @@ static KeyInfo keys[4] = {
     {PIN_KEY_DOWN, false, IDLE, 0, 0, true,  true,  false, 0},   /* 下键：相册内连发 */
 };
 
-/* 连发白名单：只在相册浏览里启用。
+/* 连发白名单：相册浏览 + 游戏（游戏里长按上下键=连续移动/换方向）。
  * TOP 长按在桌面/相机 App 是 WiFi 总开关、MID 长按是重启、CAM 长按是
  * 闪光灯拍照 —— 这些绝不能变成每 130ms 触发一次 */
 static inline bool keyRepeatAllowed(void)
 {
-    return g_appMode == MODE_GALLERY;
+    return g_appMode == MODE_GALLERY || g_appMode == MODE_GAME;
+}
+
+/* 免双击等待：相册上下键、游戏内全部按键。
+ * 相册 CAM 要留双击删除，所以只放行 repeatable 键 */
+static inline bool keyImmediateClick(const KeyInfo& k)
+{
+    if (g_appMode == MODE_GAME)    return true;
+    if (g_appMode == MODE_GALLERY) return k.repeatable;
+    return false;
 }
 
 /* 官方 IRAM 中断回调：置标志 */
@@ -170,8 +180,8 @@ static void camSingleClick() {
             if (g_galleryView == 0) g_galleryOpenReq = true;
             /* 全屏态单击不动作（摄像头未运行，删除用双击） */
             break;
-        case MODE_GAME:                    /* 游戏（俄罗斯方块）：CAM = 旋转 */
-            g_gameDirReq = 3;
+        case MODE_GAME:                    /* 游戏：CAM = 确认/旋转/右转/执行 */
+            if (g_gameCam < 8) g_gameCam++;
             break;
         case MODE_NOTES:                   /* 备忘：CAM = 删除当前选中 */
             g_noteDeleteReq = true;
@@ -198,8 +208,8 @@ static void camDoubleClick() {
     }
 }
 static void camLongPress() {
-    if (g_appMode == MODE_GAME) {              /* 游戏（俄罗斯方块）：CAM 长按 = 硬降 */
-        g_gameDirReq = 4;
+    if (g_appMode == MODE_GAME) {              /* 游戏：CAM 长按 = 硬降 */
+        if (g_gameCamHold < 4) g_gameCamHold++;
         return;
     }
     /* 闪光灯拍照仅限相机 App 实时预览态 */
@@ -214,8 +224,8 @@ static void topSingleClick() {
         g_appSel = (g_appSel + APP_COUNT - 1) % APP_COUNT;
         return;
     }
-    if (g_appMode == MODE_GAME) {             /* 游戏（俄罗斯方块）：TOP = 左移 */
-        g_gameDirReq = 1;
+    if (g_appMode == MODE_GAME) {             /* 游戏：TOP = 上一个 / 左移 / 左转 */
+        if (g_gameUp < 8) g_gameUp++;
         return;
     }
     g_btTOPstate = 1;                         /* App 内：交给各自循环消费 */
@@ -225,8 +235,8 @@ static void downSingleClick() {
         g_appSel = (g_appSel + 1) % APP_COUNT;
         return;
     }
-    if (g_appMode == MODE_GAME) {             /* 游戏（俄罗斯方块）：DOWN = 右移 */
-        g_gameDirReq = 2;
+    if (g_appMode == MODE_GAME) {             /* 游戏：DOWN = 下一个 / 右移 / 右转 */
+        if (g_gameDown < 8) g_gameDown++;
         return;
     }
     g_btDownstate = 1;
@@ -241,6 +251,8 @@ static void midSingleClick() {
         } else {
             g_appExitReq = true;
         }
+    } else if (g_appMode == MODE_GAME) {      /* 游戏：菜单=退出 App，游戏内=回菜单 */
+        g_gameMidReq = true;
     } else if (g_appMode != MODE_DESKTOP) {   /* 占位 App：退出回桌面 */
         g_appExitReq = true;
     }
@@ -254,6 +266,10 @@ static void topLongPress()
         if (g_navBurstUp < 24) g_navBurstUp++;
         return;
     }
+    if (g_appMode == MODE_GAME) {              /* 游戏：长按 TOP = 连续上移/左移 */
+        if (g_gameUp < 8) g_gameUp++;
+        return;
+    }
     /* [主界面 WiFi 总开关] 像手机：开=STA 自动连记忆热点（后台任务，不卡按键），
      * 关=WiFi 全关省电。桌面与相机 App 均可用 */
     web_app_wifi_user_toggle();
@@ -262,6 +278,11 @@ static void downLongPress()
 {
     if (g_appMode == MODE_GALLERY) {
         if (g_navBurstDown < 24) g_navBurstDown++;
+        return;
+    }
+    if (g_appMode == MODE_GAME) {
+        if (g_gameDown < 8) g_gameDown++;
+        return;
     }
 }
 static void midLongPress()    { ESP.restart(); }            /* 系统重启（卡死自救） */
@@ -324,9 +345,9 @@ static void handleKey(KeyInfo& key, const char* name,
             /* [翻页延迟修复] 相册上下键没有双击语义，松手立即执行单击，
              * 不再等 400ms 双击窗口 —— 原来每翻一格都要白等 400ms，
              * 这是"一个一个挪很慢"的主要体感来源之一 */
-            if (canRepeat) {
+            if (canRepeat || keyImmediateClick(key)) {
                 if (singleClick) singleClick();
-                Serial.printf("[KEY] %s 单击（相册免双击等待）\n", name);
+                Serial.printf("[KEY] %s 单击（免双击等待）\n", name);
                 key.state = IDLE;
             } else {
                 key.lastPress = now;
@@ -527,6 +548,32 @@ static void serialCmdPoll(void)
             } else if (cmd == "gopen") {
                 /* 调试：等价于列表态 CAM 单击（打开选中照片） */
                 g_galleryOpenReq = true;
+            } else if (cmd.startsWith("app ")) {
+                /* app N：直接打开第 N 个 App（0 相机 1 相册 2 设置 3 游戏 4 备忘） */
+                int n = cmd.substring(4).toInt();
+                if (n >= 0 && n < APP_COUNT) {
+                    Serial.printf("[CMD] 打开 App %d\n", n);
+                    /* 各 App 主循环都阻塞在自己的 while 里，只改 g_appMode 不会让它
+                     * 退出 —— 必须先置退出请求（游戏另有 MID 请求）再等调度器回来 */
+                    g_appExitReq = true;
+                    g_gameMidReq = true;
+                    vTaskDelay(pdMS_TO_TICKS(300));
+                    /* 残留的退出请求必须清掉，否则新 App 一进循环就立刻退出 */
+                    g_appExitReq = false;
+                    g_gameMidReq = false;
+                    ui_app_open(n);
+                } else Serial.println("[CMD] 用法 app 0..4");
+            } else if (cmd == "shot") {
+                /* shot：回传当前复用 Sprite（游戏/设置/备忘 整帧） */
+                lcd_app_dump_frame();
+            } else if (cmd.startsWith("gk ")) {
+                /* gk up|down|cam|drop：模拟游戏按键（调试/自动截图用） */
+                String k = cmd.substring(3);
+                if      (k == "up")   { if (g_gameUp < 8) g_gameUp++; }
+                else if (k == "down") { if (g_gameDown < 8) g_gameDown++; }
+                else if (k == "cam")  { if (g_gameCam < 8) g_gameCam++; }
+                else if (k == "drop") { if (g_gameCamHold < 4) g_gameCamHold++; }
+                else Serial.println("[CMD] 用法 gk up|down|cam|drop");
             } else if (cmd.startsWith("gdn ")) {
                 int n = cmd.substring(4).toInt();
                 for (int i = 0; i < n; ++i) {

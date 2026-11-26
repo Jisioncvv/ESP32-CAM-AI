@@ -26,7 +26,6 @@
 #define APP_COUNT      5      /* 桌面图标总数 */
 
 /* 跨 App 按键请求（keyTask 置位，对应 App 主循环消费清 0） */
-extern volatile int8_t g_gameDirReq;    /* 游戏：输入请求 1=左转 2=右转 3=暂停 */
 extern volatile bool g_noteDeleteReq;  /* 备忘：CAM 单击删除当前选中 */
 extern volatile bool g_wifiUiOpenReq;  /* 设置 App：CAM 单击打开 WiFi 管理界面 */
 

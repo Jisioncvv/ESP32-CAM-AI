@@ -7,7 +7,7 @@
  *   相机 App   lcd_app.h ui_camera_loop（lcd_app.cpp，预览渲染）
  *   相册 App   lcd_app.h ui_gallery_loop（lcd_app.cpp，列表/全屏）
  *   设置 App   ui_settings_loop     RAM/PSRAM/CPU/照片数/SD/WiFi 系统信息
- *   游戏 App   ui_game_loop         俄罗斯方块（TOP/DOWN 移动 CAM 旋转 长按硬降，MID 退出）
+ *   游戏 App   game_app_loop       选择页 + 俄罗斯方块 / 贪吃蛇 / 2048（game_app.cpp）
  *   备忘 App   ui_notes_loop        列表查看 + CAM 删除；Web 端 /notes 添加
  * 图标为程序化绘制（TFT_eSPI 基本图形拼装），无需额外图片素材
  * 桌面风格：白底 + iOS 彩色圆角瓷砖 + Font2 精致字体（LOAD_FONT2）
@@ -15,11 +15,13 @@
  */
 #include "config.h"
 #include "ui_app.h"
+#include "theme.h"
 #include "lcd_app.h"
 #include "camera_app.h"
 #include "rtos_app.h"
 #include "sd_app.h"
 #include "web_app.h"
+#include "game_app.h"
 #include <SD.h>
 #include <WiFi.h>
 #include <time.h>
@@ -28,92 +30,44 @@
 volatile int  g_appMode    = MODE_DESKTOP;
 volatile bool g_appExitReq = false;
 volatile int  g_appSel     = 0;
-volatile int8_t g_gameDirReq   = 0;      /* 游戏：输入请求 1=左转 2=右转 3=暂停 */
 volatile bool g_noteDeleteReq = false;   /* 备忘：删除当前选中请求 */
 volatile bool g_wifiUiOpenReq = false;   /* 设置 App：打开 WiFi 管理界面请求 */
 
-/* --------------------- App 名称与瓷砖底色（iOS 风配色） ---------------- */
+/* --------------------- App 名称与瓷砖强调色 ---------------- */
 static const char* s_appNames[APP_COUNT] = {
-    "Camera", "Album", "Setting", "Games", "Notes"
+    "Camera", "Album", "Settings", "Games", "Notes"
 };
-/* RGB565：蓝 #3478F6 / 橙 #FF9500 / 灰 #8E8E93 / 红 #FF3B30 / 黄 #FFCC00 */
+/* 深色底上够亮的强调色：青 / 薄荷 / 琥珀 / 洋红 / 天蓝 */
 static const uint16_t s_appColors[APP_COUNT] = {
-    0x33DE, 0xFCA0, 0x8C72, 0xF9C6, 0xFE60
+    0x269D, 0x5E54, 0xECE4, 0xF81F, 0x5C9F
 };
 
 void ui_app_init(void)
 {
-    Serial.println("[UI] 桌面 + App 框架就绪（轮播桌面 / 设置 / 游戏 / 备忘）");
+    Serial.println("[UI] 桌面 + App 框架就绪（主题化：深色/浅色可切）");
 }
 
-/* =====================================================================
- * 绘制目标包装：同一套调用既可画进相机 Sprite（整帧推屏，无闪烁），
- * 也可退化直绘 tft。C++11 无泛型 lambda，用结构体实现
- * [CSDN/资料确认] TFT_eSPI 防闪烁标准做法 = 整帧画进 TFT_eSprite 后
- * 一次 pushSprite；此前桌面只显示轮廓的根因 = 图标函数直绘 tft，
- * 被 pushSprite 整屏覆盖抹掉 —— 图标也必须画进 Sprite
- * =================================================================== */
-struct Drawer {
-    TFT_eSprite* s; TFT_eSPI* t;
-    /* [根因修复] TFT_eSprite 没有重载 fillScreen()！继承版 fillScreen 内部调
-     * fillRect(0,0,_width,_height)，而 sprite 对象的 _width/_height 是从
-     * TFT_eSPI 构造函数继承的 TFT_WIDTH=240/TFT_HEIGHT=320，createSprite
-     * 不会更新它们 → 白底只涂了左侧 240 列，右侧 80 列是 calloc 黑区
-     * （串口 dump PNG 已实锤）。sprite 必须用 fillSprite()（按 _iwidth/
-     * _yHeight=320x240 正确填充），只有直绘 tft 时才用 fillScreen() */
-    void fillScreen(uint16_t c)   { if (s) s->fillSprite(c);   else t->fillScreen(c); }
-    void fillRect(int x,int y,int w,int h,uint16_t c) { if (s) s->fillRect(x,y,w,h,c); else t->fillRect(x,y,w,h,c); }
-    void fillRoundRect(int x,int y,int w,int h,int r,uint16_t c) { if (s) s->fillRoundRect(x,y,w,h,r,c); else t->fillRoundRect(x,y,w,h,r,c); }
-    void drawRoundRect(int x,int y,int w,int h,int r,uint16_t c) { if (s) s->drawRoundRect(x,y,w,h,r,c); else t->drawRoundRect(x,y,w,h,r,c); }
-    void fillTriangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t c) { if (s) s->fillTriangle(x0,y0,x1,y1,x2,y2,c); else t->fillTriangle(x0,y0,x1,y1,x2,y2,c); }
-    void fillCircle(int x,int y,int r,uint16_t c) { if (s) s->fillCircle(x,y,r,c); else t->fillCircle(x,y,r,c); }
-
-    /* 文本接口包装（游戏/面板用，Sprite 与直绘同套调用） */
-    void setTextColor(uint16_t fg, uint16_t bg) { if (s) s->setTextColor(fg,bg); else t->setTextColor(fg,bg); }
-    void setTextDatum(uint8_t d)                { if (s) s->setTextDatum(d);    else t->setTextDatum(d); }
-    void setTextFont(uint8_t f)                 { if (s) s->setTextFont(f);     else t->setTextFont(f); }
-    void setTextSize(uint8_t sz)                { if (s) s->setTextSize(sz);    else t->setTextSize(sz); }
-    void drawString(const String& str, int x, int y) {
-        if (s) s->drawString(str, x, y); else t->drawString(str, x, y);
-    }
-    void drawCentreString(const String& str, int x, int y, uint8_t font) {
-        if (s) s->drawCentreString(str, x, y, font); else t->drawCentreString(str, x, y, font);
-    }
-
-    /* 瓷片本体绘制（自动裁剪）：完整可见 → 圆角矩形；
-     * 跨越屏幕边缘 → 只画屏幕内的矩形切片（无图标），实现自然滑出/滑入，
-     * 杜绝越界写坏显存，也不会出现"右边缘消失、左边缘凭空出现"的瞬移 */
-    void tileBody(int x, int y, int w, int h, int r, uint16_t c) {
-        int x0 = x < 0 ? 0 : x, x1 = (x + w > 320) ? 320 : x + w;
-        int y0 = y < 0 ? 0 : y, y1 = (y + h > 240) ? 240 : y + h;
-        if (x1 <= x0 || y1 <= y0) return;
-        bool clipped = (x0 != x || x1 != x + w || y0 != y || y1 != y + h);
-        if (!clipped && r > 0) fillRoundRect(x, y, w, h, r, c);
-        else if (!clipped)     fillRect(x, y, w, h, c);
-        else                   fillRect(x0, y0, x1 - x0, y1 - y0, c);
-    }
-};
 
 /* =====================================================================
  * 桌面图标绘制（程序化矢量图形，44x40 区域，左上角定位 x,y）
- * 全部通过 Drawer 画进当前帧缓冲（Sprite 或 tft）
+ *   fg = 强调色（每个 App 一个），bg = 瓷片底色（镂空用，深浅主题自动适配）
  * =================================================================== */
-static void drawIconCamera(Drawer& g, int x, int y, uint16_t fg)
+static void drawIconCamera(Drawer& g, int x, int y, uint16_t fg, uint16_t bg)
 {
     g.fillRect(x + 8, y + 2, 12, 6, fg);            /* 顶部取景凸起 */
     g.fillRoundRect(x, y + 6, 44, 30, 4, fg);       /* 机身 */
-    g.fillCircle(x + 22, y + 21, 10, TFT_BLACK);    /* 镜头外圈（镂空） */
+    g.fillCircle(x + 22, y + 21, 10, bg);           /* 镜头外圈（镂空） */
     g.fillCircle(x + 22, y + 21, 6, fg);            /* 镜头内芯 */
 }
-static void drawIconAlbum(Drawer& g, int x, int y, uint16_t fg)
+static void drawIconAlbum(Drawer& g, int x, int y, uint16_t fg, uint16_t bg)
 {
     g.fillRoundRect(x, y + 2, 44, 34, 3, fg);       /* 相框 */
-    g.fillTriangle(x + 6, y + 30, x + 18, y + 12, x + 30, y + 30, TFT_BLACK);  /* 山 */
-    g.fillTriangle(x + 16, y + 30, x + 30, y + 16, x + 40, y + 30, TFT_BLACK); /* 前山 */
-    g.fillCircle(x + 34, y + 10, 4, TFT_BLACK);     /* 太阳（镂空） */
+    g.fillTriangle(x + 6, y + 30, x + 18, y + 12, x + 30, y + 30, bg);  /* 山 */
+    g.fillTriangle(x + 16, y + 30, x + 30, y + 16, x + 40, y + 30, bg); /* 前山 */
+    g.fillCircle(x + 34, y + 10, 4, bg);            /* 太阳（镂空） */
     g.fillCircle(x + 34, y + 10, 3, fg);
 }
-static void drawIconSetting(Drawer& g, int x, int y, uint16_t fg)
+static void drawIconSetting(Drawer& g, int x, int y, uint16_t fg, uint16_t bg)
 {
     for (int i = 0; i < 8; ++i) {                   /* 8 个齿 */
         float a = i * 0.7854f;                      /* 45° */
@@ -121,26 +75,25 @@ static void drawIconSetting(Drawer& g, int x, int y, uint16_t fg)
         g.fillRect(x + 19 + dx - 3, y + 18 + dy - 3, 7, 7, fg);
     }
     g.fillCircle(x + 22, y + 20, 12, fg);           /* 齿轮盘 */
-    g.fillCircle(x + 22, y + 20, 6, TFT_BLACK);     /* 中孔 */
+    g.fillCircle(x + 22, y + 20, 6, bg);            /* 中孔 */
 }
-static void drawIconGame(Drawer& g, int x, int y, uint16_t fg)
+static void drawIconGame(Drawer& g, int x, int y, uint16_t fg, uint16_t bg)
 {
     g.fillRoundRect(x, y + 6, 44, 26, 8, fg);       /* 手柄机身 */
-    g.fillRect(x + 8, y + 13, 10, 4, TFT_BLACK);    /* 十字键横 */
-    g.fillRect(x + 11, y + 10, 4, 10, TFT_BLACK);   /* 十字键竖 */
-    g.fillCircle(x + 31, y + 13, 3, TFT_BLACK);     /* A 钮 */
-    g.fillCircle(x + 37, y + 19, 3, TFT_BLACK);     /* B 钮 */
+    g.fillRect(x + 8, y + 13, 10, 4, bg);           /* 十字键横 */
+    g.fillRect(x + 11, y + 10, 4, 10, bg);          /* 十字键竖 */
+    g.fillCircle(x + 31, y + 13, 3, bg);            /* A 钮 */
+    g.fillCircle(x + 37, y + 19, 3, bg);            /* B 钮 */
 }
-static void drawIconNotes(Drawer& g, int x, int y, uint16_t fg)
+static void drawIconNotes(Drawer& g, int x, int y, uint16_t fg, uint16_t bg)
 {
     g.fillRect(x + 4, y + 2, 36, 36, fg);           /* 纸张 */
-    g.fillRect(x + 4, y + 2, 36, 7, TFT_NAVY);      /* 顶部色条 */
     for (int i = 0; i < 3; ++i)                     /* 三行字线 */
-        g.fillRect(x + 9, y + 14 + i * 8, 26, 2, TFT_BLACK);
+        g.fillRect(x + 9, y + 14 + i * 8, 26, 2, bg);
 }
 
 /* 图标分发表 */
-typedef void (*IconDraw)(Drawer&, int, int, uint16_t);
+typedef void (*IconDraw)(Drawer&, int, int, uint16_t, uint16_t);
 static const IconDraw s_icons[APP_COUNT] = {
     drawIconCamera, drawIconAlbum, drawIconSetting, drawIconGame, drawIconNotes
 };
@@ -163,7 +116,8 @@ static TFT_eSprite* s_deskSpr = nullptr;
  * =================================================================== */
 static void draw_desktop_status(Drawer& g)
 {
-    g.fillRect(196, 0, 124, 20, TFT_WHITE);     /* 状态区清底（重绘不残影） */
+    const Theme* th = g_th;
+    g.fillRect(196, 0, 124, 22, th->bg);        /* 状态区清底（重绘不残影） */
 
     /* ---- 时间 HH:MM ---- */
     struct tm tmv;
@@ -172,11 +126,11 @@ static void draw_desktop_status(Drawer& g)
         snprintf(clockStr, sizeof(clockStr), "%02d:%02d", tmv.tm_hour, tmv.tm_min);
     else
         strcpy(clockStr, "--:--");
+    g.setTextDatum(TR_DATUM);
     g.setTextFont(1);
     g.setTextSize(1);
-    g.setTextColor(TFT_DARKGREY, TFT_WHITE);
-    g.setTextDatum(TR_DATUM);
-    g.drawString(clockStr, 314, 6);
+    g.setTextColor(th->text, th->bg);
+    g.drawString(clockStr, 314, 8);
     g.setTextDatum(TL_DATUM);
 
     /* ---- WiFi 4 格信号柱（RSSI 分档） ---- */
@@ -185,16 +139,16 @@ static void draw_desktop_status(Drawer& g)
         long r = WiFi.RSSI();
         level = (r > -55) ? 4 : (r > -65) ? 3 : (r > -75) ? 2 : 1;
     }
-    int bx = 246, base = 17;
+    int bx = 248, base = 18;
     for (int i = 0; i < 4; ++i) {
-        int h = 3 + i * 3;                       /* 3/6/9/12 递增 */
-        uint16_t c = (i < level) ? 0x33DE : 0xC618;
-        g.fillRect(bx + i * 5, base - h, 3, h, c);
+        int h = 4 + i * 3;
+        g.fillRect(bx + i * 5, base - h, 3, h, (i < level) ? th->ok : th->line);
     }
 }
 
 static void draw_desktop_frame(float off, int dbgStage = 0)
 {
+    const Theme* th = g_th;
     if (!s_deskSpr) {
         s_deskSpr = new TFT_eSprite(&tft);
         s_deskSpr->setColorDepth(16);
@@ -206,9 +160,15 @@ static void draw_desktop_frame(float off, int dbgStage = 0)
     TFT_eSprite* spr = s_deskSpr;
     Drawer g = { spr, &tft };          /* 桌面 Sprite 优先，失败退化直绘 */
 
-    g.fillScreen(TFT_WHITE);                          /* 整屏白底（顶栏已按需求去掉） */
-    if (dbgStage == 1) { if (spr) spr->pushSprite(0, 0); return; }   /* 调试：仅白底 */
+    g.fillScreen(th->bg);
+    if (dbgStage == 1) { if (spr) spr->pushSprite(0, 0); return; }   /* 调试：仅底色 */
 
+    /* 左上角标识（弱化，替代原来的纯白空顶栏） */
+    g.setTextDatum(TL_DATUM);
+    g.setTextFont(1);
+    g.setTextSize(1);
+    g.setTextColor(th->muted, th->bg);
+    g.drawString("ESP32-CAM", 12, 8);
     draw_desktop_status(g);                            /* 右上角：WiFi 信号 + 时间 */
 
     /* 瓷片布局（84/60/44 递进，间距 4px，静止时整体 6..314 对称居中）：
@@ -227,7 +187,7 @@ static void draw_desktop_frame(float off, int dbgStage = 0)
                              : (int)(60.0f - 16.0f * (ad - 1.0f));
         ss[i] = s;
         sx[i] = 160 + (int)(d < 0 ? -ofs : ofs) - s / 2;
-        sy[i] = 120 - s / 2;
+        sy[i] = 116 - s / 2;
     }
     for (int a = 0; a < APP_COUNT; ++a) order[a] = a;   /* 选择排序：|d| 降序 */
     for (int a = 0; a < APP_COUNT; ++a)
@@ -244,25 +204,31 @@ static void draw_desktop_frame(float off, int dbgStage = 0)
         int x = sx[i], y = sy[i], s = ss[i];
         bool full = (x >= 0 && x + s <= 320);           /* 完整可见才画图标/边框 */
         bool selp = (i == center);
-        if (selp) {
-            if (full) g.fillRect(x + 4, y + 4, s, s, 0xC618);    /* 灰影 = 立体 */
-            g.tileBody(x, y, s, s, 10, s_appColors[i]);
-            if (full)
-                for (int b2 = 0; b2 < 3; ++b2)                   /* 白色高光边框 */
-                    g.drawRoundRect(x + b2, y + b2, s - 2 * b2, s - 2 * b2, 10 - b2, TFT_WHITE);
-        } else {
-            g.tileBody(x, y, s, s, 8, s_appColors[i]);
-        }
-        if (full && dbgStage == 0) s_icons[i](g, x + (s - 44) / 2, y + (s - 40) / 2, TFT_WHITE);
+        uint16_t tile = selp ? th->surface2 : th->surface;
+        g.tileBody(x, y, s, s, selp ? 12 : 10, tile);
+        if (!th->dark && full)                          /* 浅色主题：瓷片需要描边 */
+            g.drawRoundRect(x, y, s, s, selp ? 12 : 10, th->line);
+        if (selp && full)
+            g.drawRoundRect(x + 1, y + 1, s - 2, s - 2, 11, s_appColors[i]);
+        if (full && dbgStage == 0)
+            s_icons[i](g, x + (s - 44) / 2, y + (s - 40) / 2, s_appColors[i], tile);
     }
 
-    if (dbgStage == 2) { if (spr) spr->pushSprite(0, 0); return; }   /* 调试：白底+瓷片 */
+    if (dbgStage == 2) { if (spr) spr->pushSprite(0, 0); return; }   /* 调试：底色+瓷片 */
 
-    /* 底部指示点 */
+    /* 选中 App 名称 + 底部指示点 */
+    g.setTextDatum(MC_DATUM);
+    g.setTextFont(2);
+    g.setTextSize(1);
+    g.setTextColor(th->text, th->bg);
+    g.drawString(s_appNames[center], 160, 176);
+
     for (int i = 0; i < APP_COUNT; ++i) {
-        int px = 160 - (APP_COUNT - 1) * 10 + i * 20;
-        g.fillCircle(px, 222, i == center ? 4 : 2, i == center ? TFT_NAVY : 0xC618);
+        int px = 160 - (APP_COUNT - 1) * 9 + i * 18;
+        if (i == center) g.fillRoundRect(px - 7, 214, 14, 4, 2, th->accent);
+        else             g.fillCircle(px, 216, 2, th->line);
     }
+    g.setTextDatum(TL_DATUM);
 
     if (spr) spr->pushSprite(0, 0);    /* 整帧一次推屏：无闪烁、动画连贯 */
 }
@@ -390,11 +356,11 @@ static String kb_key_label(int k)
 static void kb_draw_key(int k, bool sel)
 {
     int x, y, w, h; kb_key_rect(k, x, y, w, h);
-    uint16_t bg = sel ? TFT_NAVY
+    uint16_t bg = sel ? g_th->text
                 : (k == 44) ? 0x03E0
                 : (k == 43) ? 0xD69A : 0xE71C;
-    uint16_t fg = sel ? TFT_WHITE
-                : (k == 44) ? TFT_WHITE : TFT_NAVY;
+    uint16_t fg = sel ? g_th->text
+                : (k == 44) ? g_th->text : g_th->text;
     tft.fillRect(x + 1, y + 1, w - 2, h - 2, bg);
     tft.setTextColor(fg, bg);
     tft.setTextSize(1);
@@ -406,11 +372,11 @@ static void kb_draw_key(int k, bool sel)
 /* 密码行原位刷新（含光标 _，白底深字统一风格） */
 static void kb_draw_pass(void)
 {
-    tft.fillRect(0, 24, 320, 20, TFT_WHITE);
-    tft.drawFastHLine(0, 44, 320, 0xC618);
+    tft.fillRect(0, 24, 320, 20, g_th->surface);
+    tft.drawFastHLine(0, 44, 320, g_th->surface2);
     tft.setTextSize(2);
     tft.setTextFont(2);
-    tft.setTextColor(TFT_NAVY, TFT_WHITE);
+    tft.setTextColor(g_th->text, g_th->surface);
     tft.setCursor(4, 26);
     String d = s_wPass;
     if (d.length() > 25) d = d.substring(d.length() - 25);   /* 长密码显示尾部 */
@@ -421,11 +387,11 @@ static void kb_draw_pass(void)
 /* 小键盘整屏（白底 + 深蓝顶栏，与桌面/设置统一） */
 static void kb_draw_screen(void)
 {
-    tft.fillScreen(TFT_WHITE);
-    tft.fillRect(0, 0, 320, 22, TFT_NAVY);
+    tft.fillScreen(g_th->bg);
+    tft.fillRect(0, 0, 320, 22, g_th->header);
     tft.setTextSize(1);
     tft.setTextFont(2);
-    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.setTextColor(g_th->text, g_th->header);
     tft.setCursor(4, 4);
     String t = s_wCurSsid;
     if (t.length() > 24) t = t.substring(0, 24);
@@ -433,7 +399,7 @@ static void kb_draw_screen(void)
     tft.setTextFont(1);
     kb_draw_pass();
     for (int k = 0; k < 45; ++k) kb_draw_key(k, k == s_kbCur);
-    tft.setTextColor(0x8410, TFT_WHITE);
+    tft.setTextColor(g_th->muted, g_th->surface);
     tft.setCursor(4, 216);
     tft.print("TOP/DN=move(hold=fast)  CAM=select  MID=cancel");
 }
@@ -441,67 +407,67 @@ static void kb_draw_screen(void)
 /* ---- 扫描/连接/结果 页面（统一白底 + 深蓝顶栏） ---- */
 static void wifi_scan_wait_draw(void)
 {
-    tft.fillScreen(TFT_WHITE);
-    tft.fillRect(0, 0, 320, 22, TFT_NAVY);
+    tft.fillScreen(g_th->bg);
+    tft.fillRect(0, 0, 320, 22, g_th->header);
     tft.setTextFont(2);
     tft.setTextSize(1);
-    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.setTextColor(g_th->text, g_th->header);
     tft.setCursor(6, 4);
     tft.print("WiFi Setup");
     tft.setTextFont(1);
     tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_NAVY, TFT_WHITE);
+    tft.setTextColor(g_th->text, g_th->surface);
     tft.drawString("Scanning WiFi...", 160, 100);
-    tft.setTextColor(0x8410, TFT_WHITE);
+    tft.setTextColor(g_th->muted, g_th->surface);
     tft.drawString("2.4GHz, about 3 seconds", 160, 128);
     tft.setTextDatum(TL_DATUM);
 }
 
 static void wifi_conn_draw(const String& ssid)
 {
-    tft.fillScreen(TFT_WHITE);
-    tft.fillRect(0, 0, 320, 22, TFT_NAVY);
+    tft.fillScreen(g_th->bg);
+    tft.fillRect(0, 0, 320, 22, g_th->header);
     tft.setTextFont(2);
     tft.setTextSize(1);
-    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.setTextColor(g_th->text, g_th->header);
     tft.setCursor(6, 4);
     tft.print("Connecting...");
     tft.setTextFont(1);
     tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_NAVY, TFT_WHITE);
+    tft.setTextColor(g_th->text, g_th->surface);
     String t = ssid;
     if (t.length() > 20) t = t.substring(0, 20);
     tft.drawString(t, 160, 104);
-    tft.setTextColor(0x8410, TFT_WHITE);
+    tft.setTextColor(g_th->muted, g_th->surface);
     tft.drawString("please wait (up to 15s)", 160, 130);
     tft.setTextDatum(TL_DATUM);
 }
 
 static void wifi_result_draw(bool ok, const String& info)
 {
-    tft.fillScreen(TFT_WHITE);
+    tft.fillScreen(g_th->bg);
     tft.fillRect(0, 0, 320, 22, ok ? 0x03E0 : 0xE71C);
     tft.setTextFont(2);
     tft.setTextSize(1);
-    tft.setTextColor(ok ? TFT_WHITE : TFT_NAVY, ok ? 0x03E0 : 0xE71C);
+    tft.setTextColor(ok ? g_th->text : g_th->text, ok ? 0x03E0 : 0xE71C);
     tft.setCursor(6, 4);
     tft.print(ok ? "Connected OK" : "Connect FAILED");
     tft.setTextFont(1);
     tft.setTextDatum(MC_DATUM);
     if (ok) {
         tft.setTextSize(2);
-        tft.setTextColor(TFT_NAVY, TFT_WHITE);
+        tft.setTextColor(g_th->text, g_th->surface);
         tft.drawString("IP: " + info, 160, 100);
         tft.setTextSize(1);
-        tft.setTextColor(0x8410, TFT_WHITE);
+        tft.setTextColor(g_th->muted, g_th->surface);
         tft.drawString("Browser (same WiFi) -> this IP", 160, 132);
     } else {
         tft.setTextSize(1);
-        tft.setTextColor(TFT_RED, TFT_WHITE);
+        tft.setTextColor(TFT_RED, g_th->surface);
         tft.drawString(info, 160, 108);
     }
     tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(0x8410, TFT_WHITE);
+    tft.setTextColor(g_th->muted, g_th->surface);
     tft.setCursor(4, 224);
     tft.print("CAM/MID = back");
 }
@@ -509,12 +475,12 @@ static void wifi_result_draw(bool ok, const String& info)
 /* WiFi 主菜单（白底 iOS 风，与设置页一致） */
 static void wifi_menu_draw(int sel)
 {
-    tft.fillScreen(TFT_WHITE);
-    tft.fillRect(0, 0, 320, 24, TFT_NAVY);
+    tft.fillScreen(g_th->bg);
+    tft.fillRect(0, 0, 320, 24, g_th->header);
     tft.setTextFont(2);
     tft.setTextSize(1);
     tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.setTextColor(g_th->text, g_th->header);
     tft.drawString("WiFi Setup", 160, 12);
     tft.setTextDatum(TL_DATUM);
 
@@ -524,21 +490,21 @@ static void wifi_menu_draw(int sel)
     for (int i = 0; i < 3; ++i) {
         int y = 42 + i * 36;
         if (i == sel) {
-            tft.fillRect(8, y - 6, 304, 30, 0xC618);
-            tft.drawRoundRect(8, y - 6, 304, 30, 6, TFT_NAVY);
+            tft.fillRect(8, y - 6, 304, 30, g_th->surface2);
+            tft.drawRoundRect(8, y - 6, 304, 30, 6, g_th->header);
         }
         tft.setTextFont(2);
         tft.setTextSize(1);
-        tft.setTextColor(i == sel ? TFT_NAVY : 0x630C,
-                         i == sel ? 0xC618 : TFT_WHITE);
+        tft.setTextColor(i == sel ? g_th->text : g_th->muted,
+                         i == sel ? g_th->surface2 : g_th->text);
         tft.setCursor(20, y);
         tft.print(items[i]);
     }
-    tft.setTextColor(0x8410, TFT_WHITE);
+    tft.setTextColor(g_th->muted, g_th->surface);
     tft.setCursor(20, 42 + 3 * 36);
     tft.print("Status: " + web_app_wifi_status_text());
-    tft.fillRect(0, 224, 320, 16, TFT_NAVY);
-    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.fillRect(0, 224, 320, 16, g_th->header);
+    tft.setTextColor(g_th->text, g_th->header);
     tft.setCursor(6, 227);
     tft.print("TOP/DN=move  CAM=select  MID=back");
 }
@@ -546,18 +512,18 @@ static void wifi_menu_draw(int sel)
 /* 扫描结果列表（统一白底 + 深蓝顶栏，选中行浅灰高亮） */
 static void wifi_list_draw(int sel)
 {
-    tft.fillScreen(TFT_WHITE);
-    tft.fillRect(0, 0, 320, 22, TFT_NAVY);
+    tft.fillScreen(g_th->bg);
+    tft.fillRect(0, 0, 320, 22, g_th->header);
     tft.setTextFont(2);
     tft.setTextSize(1);
-    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.setTextColor(g_th->text, g_th->header);
     tft.setCursor(6, 4);
     tft.print("WiFi List  " + String(s_wCount) + " found");
     tft.setTextFont(1);
 
     if (s_wCount == 0) {
         tft.setTextDatum(MC_DATUM);
-        tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
+        tft.setTextColor(g_th->muted, g_th->surface);
         tft.drawString("No networks", 160, 108);
         tft.setTextDatum(TL_DATUM);
         return;
@@ -569,8 +535,8 @@ static void wifi_list_draw(int sel)
         int idx = s_wListTop + i;
         int y = 26 + i * 22;
         bool s = (idx == sel);
-        if (s) tft.fillRect(4, y - 2, 312, 20, 0xC618);
-        tft.setTextColor(s ? TFT_NAVY : 0x630C, s ? 0xC618 : TFT_WHITE);
+        if (s) tft.fillRect(4, y - 2, 312, 20, g_th->surface2);
+        tft.setTextColor(s ? g_th->text : g_th->muted, s ? g_th->surface2 : g_th->text);
         tft.setCursor(8, y + 2);
         String nm = s_wSsid[idx];
         if (nm.length() > 22) nm = nm.substring(0, 22);
@@ -580,8 +546,8 @@ static void wifi_list_draw(int sel)
         tft.setCursor(262, y + 2);
         tft.print(String(s_wRssi[idx]) + "dBm");
     }
-    tft.fillRect(0, 226, 320, 14, TFT_NAVY);
-    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.fillRect(0, 226, 320, 14, g_th->header);
+    tft.setTextColor(g_th->text, g_th->header);
     tft.setCursor(6, 229);
     tft.print("TOP/DN=move  CAM=connect  MID=back");
 }
@@ -734,65 +700,61 @@ static void ui_wifi_loop(void)
 }
 
 /* =====================================================================
- * 设置 App：系统信息页（防闪烁：框架/标签只画一次，每秒只重写数值）
- * RAM / PSRAM / CPU 频率 / 运行时长 / 照片数 / SD / WiFi
- * [乱码根因修复] 开机自检页遗留 setTextSize(2)，首次进设置页时
- * 大字号叠行看似乱码（退出重进后因 update 已设回 1 而恢复）——
- * 每次绘制框架前显式复位 TextSize/TextFont/Datum，杜绝上游残留
+ * 设置 App：系统信息 + 主题切换
+ * ---------------------------------------------------------------------
+ * 版式：内存卡片（RAM/PSRAM 进度条）→ 系统信息卡片 → WiFi 行 → 两个操作
+ * 按键：TOP/DOWN 在两个操作间切换焦点，CAM 执行（WiFi 设置 / 换主题）
+ * 每秒整帧重画进 Sprite 再推屏：数值刷新不闪、也不会留残影
  * =================================================================== */
-static const int SET_ROW_Y = 34, SET_ROW_H = 22, SET_VAL_X = 308;
-static const int SET_ROWS  = 8;                    /* RAM..WiFi 共 8 行可更新 */
+static int s_setSel = 0;                 /* 0=WiFi setup  1=Theme */
 
-static void draw_settings_frame(void)              /* 静态框架 + 标签（进 App 画一次） */
+static void settings_draw(Drawer& g)
 {
-    tft.setTextDatum(TL_DATUM);                    /* 复位全部文本状态 */
-    tft.setTextSize(1);
-    tft.setTextFont(2);
-    tft.fillScreen(TFT_WHITE);
-    tft.fillRect(0, 0, 320, 24, TFT_NAVY);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_WHITE, TFT_NAVY);
-    tft.drawString("Settings", 160, 12);
-    tft.setTextFont(2);
-    tft.setTextDatum(TL_DATUM);
+    const Theme* th = g_th;
+    g.fillScreen(th->bg);
+    ui_header(g, "Settings", "v3.0");
 
-    static const char* labels[SET_ROWS] = {
-        "RAM", "PSRAM", "CPU", "Uptime", "Photos", "SD", "WiFi", "FW"
+    /* ---- 内存卡片 ---- */
+    uint32_t hT = ESP.getHeapSize(),  hF = ESP.getFreeHeap();
+    uint32_t pT = ESP.getPsramSize(), pF = ESP.getFreePsram();
+    ui_card(g, 10, 36, 300, 68, th->surface);
+    g.setTextFont(1);
+    g.setTextSize(1);
+    g.setTextDatum(TL_DATUM);
+    g.setTextColor(th->muted, th->surface);
+    g.drawString("RAM", 22, 44);
+    g.setTextDatum(TR_DATUM);
+    g.setTextColor(th->text, th->surface);
+    g.drawString(String((hT - hF) / 1024) + " / " + String(hT / 1024) + " KB", 298, 44);
+    ui_bar(g, 22, 60, 276, hT ? (float)(hT - hF) / (float)hT : 0, th->accent);
+
+    g.setTextDatum(TL_DATUM);
+    g.setTextColor(th->muted, th->surface);
+    g.drawString("PSRAM", 22, 76);
+    g.setTextDatum(TR_DATUM);
+    g.setTextColor(th->text, th->surface);
+    g.drawString(String((pT - pF) / 1024) + " / " + String(pT / 1024) + " KB", 298, 76);
+    ui_bar(g, 22, 92, 276, pT ? (float)(pT - pF) / (float)pT : 0, th->ok);
+
+    /* ---- 系统信息卡片 ---- */
+    ui_card(g, 10, 108, 300, 64, th->surface);
+    auto row = [&](int i, const char* label, const String& value, uint16_t vc) {
+        int y = 116 + i * 14;
+        g.setTextDatum(TL_DATUM);
+        g.setTextColor(th->muted, th->surface);
+        g.drawString(label, 22, y);
+        g.setTextDatum(TR_DATUM);
+        g.setTextColor(vc, th->surface);
+        g.drawString(value, 298, y);
     };
-    for (int r = 0; r < SET_ROWS; ++r) {
-        tft.setTextColor(0x630C, TFT_WHITE);       /* 深灰标签（白底不闪） */
-        tft.setCursor(12, SET_ROW_Y + r * SET_ROW_H);
-        tft.print(labels[r]);
-    }
-    /* 底部操作提示（CAM 进 WiFi 管理） */
-    tft.fillRect(0, 224, 320, 16, TFT_NAVY);
-    tft.setTextColor(TFT_WHITE, TFT_NAVY);
-    tft.setCursor(6, 227);
-    tft.print("CAM=WiFi Setup   MID=exit");
-}
-
-static void update_settings_values(void)           /* 数值原位刷新（不带 fillScreen） */
-{
-    uint32_t heapTot = ESP.getHeapSize(),  heapFree = ESP.getFreeHeap();
-    uint32_t psTot   = ESP.getPsramSize(), psFree   = ESP.getFreePsram();
-    uint32_t up      = millis() / 1000;
-
-    tft.setTextDatum(TR_DATUM);
-    tft.setTextSize(1);
-    tft.setTextPadding(140);           /* [残影修复] 新值比旧值短时残留字符 */
-    auto val = [&](int r, String v) {
-        tft.setTextColor(TFT_BLACK, TFT_WHITE);    /* 不透明白底：覆盖旧值无残影 */
-        tft.drawString(v, SET_VAL_X, SET_ROW_Y + r * SET_ROW_H);
-    };
-    val(0, String(heapFree / 1024) + " / " + heapTot / 1024 + " KB");
-    val(1, String(psFree / 1024) + " / " + psTot / 1024 + " KB");
-    val(2, String(ESP.getCpuFreqMHz()) + " MHz");
+    uint32_t up = millis() / 1000;
     char upt[20];
     snprintf(upt, sizeof(upt), "%lu:%02lu:%02lu",
-             (unsigned long)(up / 3600), (unsigned long)((up / 60) % 60), (unsigned long)(up % 60));
-    val(3, String(upt));
+             (unsigned long)(up / 3600), (unsigned long)((up / 60) % 60),
+             (unsigned long)(up % 60));
+    row(0, "CPU",      String(ESP.getCpuFreqMHz()) + " MHz", th->text);
+    row(1, "Uptime",   String(upt), th->text);
 
-    /* 照片数扫 SD 较慢，5 秒才扫一次 */
     static int photos = -1;
     static uint32_t lastScan = 0;
     if (photos < 0 || millis() - lastScan > 5000) {
@@ -807,32 +769,67 @@ static void update_settings_values(void)           /* 数值原位刷新（不�
         }
         lastScan = millis();
     }
-    val(4, String(photos));
-    val(5, sd_app_is_ready() ? "Ready" : "Missing");
-    val(6, web_app_wifi_status_text());            /* STA IP / AP 192.168.4.1 / OFF */
-    val(7, "v2.4 wifi-kb");
-    tft.setTextPadding(0);
-    tft.setTextDatum(TL_DATUM);
+    row(2, "Photos", String(photos), th->text);
+    row(3, "SD card", sd_app_is_ready() ? "ready" : "missing",
+        sd_app_is_ready() ? th->ok : th->danger);
+
+    /* ---- WiFi 行 ---- */
+    g.setTextDatum(TL_DATUM);
+    g.setTextColor(th->muted, th->bg);
+    g.drawString("WiFi", 22, 180);
+    g.setTextDatum(TR_DATUM);
+    String ws = web_app_wifi_status_text();
+    g.setTextColor(ws.indexOf("OFF") >= 0 ? th->muted : th->warn, th->bg);
+    g.drawString(ws, 298, 180);
+
+    /* ---- 两个操作按钮 ---- */
+    g.setTextDatum(MC_DATUM);
+    g.setTextFont(1);
+    g.setTextSize(1);
+    const char* act[2] = { "WiFi setup", g_themeDark ? "Theme: dark" : "Theme: light" };
+    for (int i = 0; i < 2; ++i) {
+        int x = i ? 162 : 10;
+        bool on = (s_setSel == i);
+        g.fillRoundRect(x, 198, 148, 22, 8, on ? th->surface2 : th->surface);
+        if (on) g.drawRoundRect(x, 198, 148, 22, 8, th->accent);
+        g.setTextColor(on ? th->accent : th->muted, on ? th->surface2 : th->surface);
+        g.drawString(act[i], x + 74, 209);
+    }
+    g.setTextDatum(TL_DATUM);
 }
 
 static void ui_settings_loop(void)
 {
-    draw_settings_frame();
-    update_settings_values();
+    Drawer g = { lcd_app_get_spr(), &tft };
+    auto redraw = [&]() {
+        settings_draw(g);
+        if (g.s) g.s->pushSprite(0, 0);
+    };
+    s_setSel = 0;
+    redraw();
     uint32_t lastUpd = millis();
     while (!g_appExitReq) {
-        if (g_wifiUiOpenReq) {                     /* CAM 单击：进 WiFi 管理子界面 */
+        if (g_wifiUiOpenReq) {                     /* CAM 单击：执行当前焦点项 */
             g_wifiUiOpenReq = false;
-            ui_wifi_loop();
-            g_btTOPstate = g_btDownstate = 0;      /* 清子界面残留按键标志 */
-            draw_settings_frame();                 /* 整页重画（被子界面覆盖过） */
-            update_settings_values();
+            if (s_setSel == 0) {
+                ui_wifi_loop();
+                g_btTOPstate = g_btDownstate = 0;  /* 清子界面残留按键标志 */
+            } else {
+                theme_toggle();                    /* 深/浅色切换，NVS 掉电保持 */
+            }
+            redraw();
             lastUpd = millis();
             continue;
         }
+        if (g_btTOPstate || g_btDownstate) {       /* TOP/DOWN 换焦点 */
+            g_btTOPstate = g_btDownstate = 0;
+            s_setSel ^= 1;
+            redraw();
+            continue;
+        }
         uint32_t now = millis();
-        if (now - lastUpd >= 1000) {   /* 1 秒刷新数值（不重画整页 → 不闪） */
-            update_settings_values();
+        if (now - lastUpd >= 1000) {               /* 1 秒整帧刷新 */
+            redraw();
             lastUpd = now;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -842,224 +839,14 @@ static void ui_settings_loop(void)
 }
 
 /* =====================================================================
- * 游戏 App：俄罗斯方块（Tetris）
- *   TOP = 左移  DOWN = 右移  CAM 单击 = 旋转（带踢墙）  CAM 长按 = 硬降
- *   MID 单击 = 退出（keyTask 通用分支）  Game Over 后任意键重开
- * 按键语义 g_gameDirReq：1=左移 2=右移 3=旋转 4=硬降
- * [贪吃蛇教训] 棋盘等大状态一律 static —— 贪吃蛇 2.4KB 栈数组曾撑爆
- * 任务栈导致"一启动就崩"；static 局部变量在 BSS 段，无栈压力
- * 渲染复用相机离屏 Sprite 整帧绘制（防闪烁），Sprite 不可用时退化直绘
- * =================================================================== */
-#define TET_COLS 10
-#define TET_ROWS 20
-#define TET_CELL 12                 /* 棋盘 120x240 屏幕左侧，右侧信息面板 */
-
-/* 7 种方块 × 4 旋转态 × 4 个 (dx,dy)：各旋转态在 4x4 盒内的格子坐标 */
-static const uint8_t s_tetShapes[7][4][8] = {
-    { /* I */
-        {0,1,1,1,2,1,3,1}, {2,0,2,1,2,2,2,3},
-        {0,2,1,2,2,2,3,2}, {1,0,1,1,1,2,1,3} },
-    { /* O */
-        {1,0,2,0,1,1,2,1}, {1,0,2,0,1,1,2,1},
-        {1,0,2,0,1,1,2,1}, {1,0,2,0,1,1,2,1} },
-    { /* T */
-        {1,0,0,1,1,1,2,1}, {1,0,1,1,2,1,1,2},
-        {0,1,1,1,2,1,1,2}, {1,0,0,1,1,1,1,2} },
-    { /* S */
-        {1,0,2,0,0,1,1,1}, {1,0,1,1,2,1,2,2},
-        {1,1,2,1,0,2,1,2}, {0,0,0,1,1,1,1,2} },
-    { /* Z */
-        {0,0,1,0,1,1,2,1}, {2,0,1,1,2,1,1,2},
-        {0,1,1,1,1,2,2,2}, {1,0,0,1,1,1,0,2} },
-    { /* J */
-        {0,0,0,1,1,1,2,1}, {1,0,2,0,1,1,1,2},
-        {0,1,1,1,2,1,2,2}, {1,0,1,1,0,2,1,2} },
-    { /* L */
-        {2,0,0,1,1,1,2,1}, {1,0,1,1,1,2,2,2},
-        {0,1,1,1,2,1,0,2}, {0,0,1,0,1,1,1,2} },
-};
-
-/* 方块配色（I 青 O 黄 T 紫 S 绿 Z 红 J 蓝 L 橙） */
-static const uint16_t s_tetColors[7] = {
-    0x07FF, 0xFFE0, 0xF81F, 0x07E0, 0xF800, 0x001F, 0xFD20
-};
-
-static uint8_t s_tetBoard[TET_ROWS][TET_COLS];   /* 0=空 1..7=方块色号 */
-
-/* 碰撞检测：方块 t/r 态放到 (px,py) 是否越界或压到已有格子 */
-static bool tet_collide(int t, int r, int px, int py)
-{
-    const uint8_t* c = s_tetShapes[t][r];
-    for (int i = 0; i < 4; ++i) {
-        int bx = px + c[i * 2], by = py + c[i * 2 + 1];
-        if (bx < 0 || bx >= TET_COLS || by >= TET_ROWS) return true;
-        if (by >= 0 && s_tetBoard[by][bx]) return true;
-    }
-    return false;
-}
-
-/* 落定：写进棋盘（by<0 顶部外的格子忽略） */
-static void tet_lock(int t, int r, int px, int py)
-{
-    const uint8_t* c = s_tetShapes[t][r];
-    for (int i = 0; i < 4; ++i) {
-        int bx = px + c[i * 2], by = py + c[i * 2 + 1];
-        if (by >= 0 && by < TET_ROWS && bx >= 0 && bx < TET_COLS)
-            s_tetBoard[by][bx] = (uint8_t)(t + 1);
-    }
-}
-
-/* 消行：满行下移，返回消除行数 */
-static int tet_clear_lines(void)
-{
-    int cleared = 0;
-    for (int y = TET_ROWS - 1; y >= 0; --y) {
-        bool full = true;
-        for (int x = 0; x < TET_COLS; ++x)
-            if (!s_tetBoard[y][x]) { full = false; break; }
-        if (full) {
-            ++cleared;
-            for (int yy = y; yy > 0; --yy)
-                for (int x = 0; x < TET_COLS; ++x) s_tetBoard[yy][x] = s_tetBoard[yy - 1][x];
-            for (int x = 0; x < TET_COLS; ++x) s_tetBoard[0][x] = 0;
-            ++y;   /* 当行重查（上面的行落下来后可能也满） */
-        }
-    }
-    return cleared;
-}
-
-static void ui_game_loop(void)
-{
-    TFT_eSprite* spr = lcd_app_get_spr();
-    Drawer g = { spr, &tft };
-    const int BX = 24, BY = 0;           /* 棋盘屏幕原点（120 宽，右侧面板 160..316） */
-
-    int curT = 0, curR = 0, curX = 3, curY = 0, nextT = 0;
-    int score = 0, lines = 0, over = 0;
-    uint32_t tickMs = 500, lastTick = millis();
-    auto spawn = [&](void) {
-        curT = nextT;
-        nextT = random(0, 7);
-        curR = 0; curX = 3; curY = 0;
-        if (tet_collide(curT, curR, curX, curY)) over = 1;   /* 出生即重叠 = 顶死 */
-        tickMs = (500 - lines * 10 > 120) ? (500 - lines * 10) : 120;
-    };
-    /* 开局：清盘 + 发两块 */
-    for (int y = 0; y < TET_ROWS; ++y)
-        for (int x = 0; x < TET_COLS; ++x) s_tetBoard[y][x] = 0;
-    nextT = random(0, 7);
-    score = lines = over = 0;
-    spawn();
-    g_gameDirReq = 0;
-
-    while (!g_appExitReq) {
-        /* ---- 输入：每帧最多消费一个请求 ---- */
-        if (g_gameDirReq) {
-            int8_t req = g_gameDirReq; g_gameDirReq = 0;
-            if (over) {                              /* Game Over 任意键重开 */
-                for (int y = 0; y < TET_ROWS; ++y)
-                    for (int x = 0; x < TET_COLS; ++x) s_tetBoard[y][x] = 0;
-                score = lines = 0; tickMs = 500; over = 0;
-                nextT = random(0, 7);
-                spawn();
-                lastTick = millis();
-                continue;
-            }
-            if (req == 1 && !tet_collide(curT, curR, curX - 1, curY)) --curX;
-            else if (req == 2 && !tet_collide(curT, curR, curX + 1, curY)) ++curX;
-            else if (req == 3) {                     /* 旋转 + 简单踢墙（原位/左1/右1） */
-                int nr = (curR + 1) & 3;
-                if (!tet_collide(curT, nr, curX, curY))          curR = nr;
-                else if (!tet_collide(curT, nr, curX - 1, curY)) { curR = nr; --curX; }
-                else if (!tet_collide(curT, nr, curX + 1, curY)) { curR = nr; ++curX; }
-            }
-            else if (req == 4) {                     /* 硬降：直落到底并锁定 */
-                while (!tet_collide(curT, curR, curX, curY + 1)) ++curY;
-                tet_lock(curT, curR, curX, curY);
-                lines += tet_clear_lines();
-                score += 5;
-                spawn();
-            }
-        }
-
-        /* ---- 重力节拍（消行加速） ---- */
-        if (!over && millis() - lastTick >= tickMs) {
-            lastTick = millis();
-            if (!tet_collide(curT, curR, curX, curY + 1)) {
-                ++curY;
-            } else {                                 /* 落定 → 消行 → 下一块 */
-                tet_lock(curT, curR, curX, curY);
-                int c = tet_clear_lines();
-                lines += c;
-                score += (c == 1) ? 10 : (c == 2) ? 30 : (c == 3) ? 60 : (c == 4) ? 100 : 0;
-                spawn();
-            }
-        }
-
-        /* ---- 渲染：左棋盘 + 右面板（Next/得分/行数） ---- */
-        g.fillScreen(TFT_WHITE);
-        g.fillRect(BX - 2, BY - 2, TET_COLS * TET_CELL + 4, TET_ROWS * TET_CELL + 4, 0x8C72);  /* 边框 */
-        for (int y = 0; y < TET_ROWS; ++y)
-            for (int x = 0; x < TET_COLS; ++x)
-                if (s_tetBoard[y][x])
-                    g.fillRect(BX + x * TET_CELL + 1, BY + y * TET_CELL + 1,
-                               TET_CELL - 2, TET_CELL - 2, s_tetColors[s_tetBoard[y][x] - 1]);
-        if (!over) {
-            const uint8_t* c = s_tetShapes[curT][curR];
-            for (int i = 0; i < 4; ++i) {
-                int bx = curX + c[i * 2], by = curY + c[i * 2 + 1];
-                if (by >= 0)
-                    g.fillRect(BX + bx * TET_CELL + 1, BY + by * TET_CELL + 1,
-                               TET_CELL - 2, TET_CELL - 2, s_tetColors[curT]);
-            }
-        }
-        /* 右面板 */
-        g.fillRoundRect(160, 10, 148, 220, 8, 0xCE79);
-        g.setTextColor(TFT_BLACK, 0xCE79);
-        g.setTextDatum(TL_DATUM);
-        g.setTextFont(2);
-        g.drawCentreString("Next", 234, 22, 2);
-        {   /* Next 预览（4x4 盒居中缩放 2 格 = 8px） */
-            const uint8_t* c = s_tetShapes[nextT][0];
-            int mx = 0, Mx = 3, my = 0, My = 0;
-            for (int i = 0; i < 4; ++i) {
-                if (c[i * 2] < mx) mx = c[i * 2];
-                if (c[i * 2] > Mx) Mx = c[i * 2];
-                if (c[i * 2 + 1] < my) my = c[i * 2 + 1];
-                if (c[i * 2 + 1] > My) My = c[i * 2 + 1];
-            }
-            int ox = 234 - ((Mx - mx + 1) * 8) / 2 - mx * 8;
-            int oy = 60 - ((My - my + 1) * 8) / 2 - my * 8;
-            for (int i = 0; i < 4; ++i)
-                g.fillRect(ox + c[i * 2] * 8, oy + c[i * 2 + 1] * 8, 7, 7, s_tetColors[nextT]);
-        }
-        g.drawCentreString("Score " + String(score), 234, 110, 2);
-        g.drawCentreString("Lines " + String(lines), 234, 132, 2);
-        g.drawCentreString("T/D move", 234, 162, 1);
-        g.drawCentreString("CAM rot", 234, 174, 1);
-        g.drawCentreString("hold CAM drop", 234, 186, 1);
-        if (over) {
-            g.fillRoundRect(60, 92, 200, 64, 6, TFT_NAVY);
-            g.setTextDatum(MC_DATUM);
-            g.setTextColor(TFT_WHITE, TFT_NAVY);
-            g.drawCentreString("Game Over", 160, 110, 2);
-            g.drawCentreString("key = retry  MID = exit", 160, 132, 1);
-            g.setTextDatum(TL_DATUM);
-        }
-        if (spr) spr->pushSprite(0, 0);
-        vTaskDelay(pdMS_TO_TICKS(15));   /* 输入响应粒度（实际下落由 tickMs 控制） */
-    }
-    g_appExitReq = false;
-    g_gameDirReq = 0;
-}
-
-/* =====================================================================
  * 备忘 App：/notes.txt 每行一条（Web 端 /notes 页面添加）
  *   TOP/DOWN 移动选中；CAM 删除当前选中；MID 退出
+ * 版式：卡片式列表，选中行强调色描边 + 左侧竖条（与游戏菜单同款）
  * =================================================================== */
 static void ui_notes_loop(void)
 {
     static const int MAX_NOTES = 50;
+    static const int VISIBLE   = 7;
     String lines[50];
     int n = 0, sel = 0, top = 0;
 
@@ -1083,45 +870,50 @@ static void ui_notes_loop(void)
     };
     reload();
 
+    Drawer g = { lcd_app_get_spr(), &tft };
     auto draw = [&]() {
+        const Theme* th = g_th;
         if (sel < top) top = sel;
-        if (sel > top + 7) top = sel - 7;
-        tft.fillScreen(TFT_WHITE);
-        tft.setTextSize(1);                    /* 复位上游遗留的字号状态 */
-        tft.setTextDatum(TL_DATUM);
-        tft.fillRect(0, 0, 320, 24, TFT_NAVY);
-        tft.setTextFont(2);
-        tft.setTextDatum(MC_DATUM);
-        tft.setTextColor(TFT_WHITE, TFT_NAVY);
-        tft.drawString("Notes (" + String(n) + ")", 160, 12);
-        tft.setTextFont(1);
-        tft.setTextDatum(TL_DATUM);
+        if (sel > top + VISIBLE - 1) top = sel - (VISIBLE - 1);
+
+        g.fillScreen(th->bg);
+        ui_header(g, "Notes", (String(n) + " items").c_str());
+        ui_footer(g, "TOP/DN move   CAM delete   MID back");
 
         if (n == 0) {
-            tft.setTextDatum(MC_DATUM);
-            tft.setTextColor(0x8410, TFT_WHITE);
-            tft.drawString("no notes", 160, 110);
-            tft.drawString("add via WiFi page /notes", 160, 130);
-            tft.setTextDatum(TL_DATUM);
+            g.setTextDatum(MC_DATUM);
+            g.setTextFont(2);
+            g.setTextSize(1);
+            g.setTextColor(th->muted, th->bg);
+            g.drawString("No notes yet", 160, 108);
+            g.setTextFont(1);
+            g.drawString("add them from the web page /notes", 160, 130);
+            g.setTextDatum(TL_DATUM);
         } else {
-            for (int i = 0; i < 8 && top + i < n; ++i) {
+            for (int i = 0; i < VISIBLE && top + i < n; ++i) {
                 int idx = top + i;
-                int y = 30 + i * 22;
-                if (idx == sel) tft.fillRect(4, y - 2, 312, 20, 0xC618);  /* 选中高亮 */
-                tft.setTextColor(idx == sel ? TFT_NAVY : 0x630C,
-                                 idx == sel ? 0xC618 : TFT_WHITE);
-                tft.setCursor(10, y);
-                tft.print(idx + 1);
-                tft.print(". ");
+                int y = 34 + i * 26;
+                bool on = (idx == sel);
+                uint16_t bg = on ? th->surface2 : th->surface;
+                g.fillRoundRect(8, y, 304, 24, 8, bg);
+                if (on) {
+                    g.drawRoundRect(8, y, 304, 24, 8, th->accent);
+                    g.fillRoundRect(11, y + 7, 3, 10, 2, th->accent);
+                }
+                g.setTextDatum(TL_DATUM);
+                g.setTextFont(1);
+                g.setTextSize(1);
+                g.setTextColor(th->muted, bg);
+                g.drawString(String(idx + 1), 20, y + 8);
+
                 String t = lines[idx];
-                if (t.length() > 42) t = t.substring(0, 42);
-                tft.print(t);
+                /* 320 宽 font1：约 6px/字符，去掉序号区后约 45 字符 */
+                if (t.length() > 44) t = t.substring(0, 43) + "~";
+                g.setTextColor(on ? th->text : th->text, bg);
+                g.drawString(t, 40, y + 8);
             }
         }
-        tft.fillRect(0, 226, 320, 14, TFT_NAVY);
-        tft.setTextColor(TFT_WHITE, TFT_NAVY);
-        tft.setCursor(6, 229);
-        tft.print("UP/DN=move  CAM=del  MID=back");
+        if (g.s) g.s->pushSprite(0, 0);
     };
 
     draw();
@@ -1161,16 +953,17 @@ static void ui_notes_loop(void)
  * =================================================================== */
 static void ui_placeholder_loop(const char* title, const char* sub)
 {
-    tft.fillScreen(TFT_WHITE);
+    const Theme* th = g_th;
+    tft.fillScreen(th->bg);
     tft.setTextSize(1);
     tft.setTextDatum(MC_DATUM);
     tft.setTextFont(2);
-    tft.setTextColor(TFT_NAVY, TFT_WHITE);
+    tft.setTextColor(th->danger, th->bg);
     tft.drawString(title, 160, 90);
     tft.setTextFont(1);
-    tft.setTextColor(0x630C, TFT_WHITE);
+    tft.setTextColor(th->text, th->bg);
     tft.drawString(sub, 160, 128);
-    tft.setTextColor(0x8410, TFT_WHITE);
+    tft.setTextColor(th->muted, th->bg);
     tft.drawString("CAM / MID = back to desktop", 160, 190);
     tft.setTextDatum(TL_DATUM);
 
@@ -1304,7 +1097,7 @@ void displayTask(void* arg)
                 g_appMode = MODE_DESKTOP;
                 break;
             case MODE_GAME:
-                ui_game_loop();
+                game_app_loop();               /* 游戏选择页 + 三款游戏 */
                 g_appMode = MODE_DESKTOP;
                 break;
             case MODE_NOTES:
