@@ -22,6 +22,34 @@ extern volatile int g_photoFs;         /* 设备拍照分辨率（串口 psize �
 /* 应用官方软件配置（特效/亮度 + vflip + lenc）到当前传感器 */
 void camera_app_apply_soft_config(void);
 
+/* ---------------- 拍照档位（设置 App 可改，NVS 掉电保持） ----------------
+ * 分辨率只允许 4:3 与 16:9 两类（实测耗时见 camera_app.cpp）：
+ *   HD   1280x720  (16:9) —— 传感器上下裁切，视场比肉眼窄，但拍照最快
+ *   XGA  1024x768  (4:3)  —— 全画幅 + 约 3.6s（默认，速度画质平衡）
+ *   SXGA 1280x1024 (4:3)  —— 130 万像素，但帧率断崖 → 约 12s，按需选
+ */
+#define CAM_PSZ_COUNT 3
+int  camera_app_photo_size_get(void);            /* 0..CAM_PSZ_COUNT-1 */
+void camera_app_photo_size_set(int idx);         /* 切换并写 NVS */
+const char* camera_app_photo_size_text(int idx); /* "XGA 1024x768" */
+int  camera_app_photo_size_est_sec(int idx);     /* 预估拍照耗时（秒，给设置页显示） */
+
+/* 色彩风格：0=自然（贴近肉眼，默认） 1=鲜艳 */
+#define CAM_LOOK_COUNT 2
+int  camera_app_photo_look_get(void);
+void camera_app_photo_look_set(int idx);
+const char* camera_app_photo_look_text(int idx);
+
+/* 白平衡：0=Auto 1=Sunny 2=Cloudy 3=Office 4=Home
+ * 暗光/单色场景 Auto 会整屏偏紫，固定预设可让颜色稳定 */
+#define CAM_WB_COUNT 5
+int  camera_app_photo_wb_get(void);
+void camera_app_photo_wb_set(int idx);
+const char* camera_app_photo_wb_text(int idx);
+
+/* 启动时从 NVS 载入档位（main 里调用一次） */
+void camera_app_load_prefs(void);
+
 /* AWB/AEC 收敛：等 300ms + 丢弃 6 帧过渡帧（重初始化后调用，防预览偏红/偏黄） */
 void camera_app_settle_awb(uint8_t frames = 6);
 

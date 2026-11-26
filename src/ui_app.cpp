@@ -774,11 +774,105 @@ static void ui_wifi_loop(void)
 /* =====================================================================
  * 设置 App：系统信息 + 主题切换
  * ---------------------------------------------------------------------
- * 版式：内存卡片（RAM/PSRAM 进度条）→ 系统信息卡片 → WiFi 行 → 两个操作
- * 按键：TOP/DOWN 在两个操作间切换焦点，CAM 执行（WiFi 设置 / 换主题）
+ * 版式：内存卡片（RAM/PSRAM 进度条）→ 系统信息卡片 → 拍照档位行 → 三操作
+ * 按键：TOP/DOWN 在三个操作间切换焦点，CAM 执行（WiFi / 主题 / 拍照设置）
  * 每秒整帧重画进 Sprite 再推屏：数值刷新不闪、也不会留残影
  * =================================================================== */
-static int s_setSel = 0;                 /* 0=WiFi setup  1=Theme */
+/* =====================================================================
+ * 拍照设置子界面（设置 App → Photo）
+ * ---------------------------------------------------------------------
+ * 两组参数，CAM 循环切换，NVS 掉电保持：
+ *   Resolution —— HD(16:9) / SXGA(4:3) / UXGA(4:3)
+ *   Color      —— Natural(贴近肉眼) / Vivid(浓郁)
+ * 只给两行可选：第三行是"预估耗时"提示，让用户知道选大图要等更久。
+ * =================================================================== */
+static void photo_settings_draw(Drawer& g, int sel)
+{
+    const Theme* th = g_th;
+    g.fillScreen(th->bg);
+    ui_header(g, "Camera", "Photo");
+
+    ui_card(g, 10, 38, 300, 124, th->surface);
+
+    auto row = [&](int i, const char* label, const char* val) {
+        int y = 46 + i * 30;
+        bool on = (sel == i);
+        if (on) {
+            g.fillRoundRect(16, y, 288, 26, 8, th->selBg);
+            g.drawRoundRect(16, y, 288, 26, 8, th->accent);
+        }
+        g.setTextFont(1);
+        g.setTextSize(1);
+        g.setTextDatum(TL_DATUM);
+        g.setTextColor(th->muted, on ? th->selBg : th->surface);
+        g.drawString(label, 26, y + 9);
+        g.setTextDatum(TR_DATUM);
+        g.setTextColor(on ? th->accent : th->text, on ? th->selBg : th->surface);
+        g.drawString(val, 294, y + 9);
+        g.setTextDatum(TL_DATUM);
+    };
+    row(0, "Resolution",   camera_app_photo_size_text(camera_app_photo_size_get()));
+    row(1, "Color",        camera_app_photo_look_text(camera_app_photo_look_get()));
+    row(2, "White balance", camera_app_photo_wb_text(camera_app_photo_wb_get()));
+
+    /* 预估耗时 + 与肉眼视场的关系说明（4:3 才是传感器全画幅） */
+    char info[40];
+    snprintf(info, sizeof(info), "~%d s per shot",
+             camera_app_photo_size_est_sec(camera_app_photo_size_get()));
+    g.setTextFont(1);
+    g.setTextSize(1);
+    g.setTextDatum(TL_DATUM);
+    g.setTextColor(th->muted, th->surface);
+    g.drawString(info, 26, 140);
+
+    g.setTextColor(th->muted, th->bg);
+    g.drawString("4:3 = full sensor view (matches your eyes)", 22, 172);
+    g.drawString("Purple cast? try a fixed white balance", 22, 186);
+
+    ui_footer(g, "CAM: change    MID: back");
+}
+
+static void ui_photo_loop(void)
+{
+    Drawer g = { lcd_app_get_spr(), &tft };
+    int sel = 0;
+    const Theme* lastTh = g_th;
+    auto redraw = [&]() {
+        photo_settings_draw(g, sel);
+        if (g.s) g.s->pushSprite(0, 0);
+    };
+    redraw();
+    while (true) {
+        if (g_appExitReq) {                       /* MID = 返回设置信息页 */
+            g_appExitReq = false;
+            return;
+        }
+        if (g_th != lastTh) {                     /* 主题被外部切换：整帧重绘 */
+            lastTh = g_th;
+            redraw();
+        }
+        if (g_wifiUiOpenReq) {                    /* CAM = 循环切换当前项 */
+            g_wifiUiOpenReq = false;
+            if (sel == 0)
+                camera_app_photo_size_set((camera_app_photo_size_get() + 1) % CAM_PSZ_COUNT);
+            else if (sel == 1)
+                camera_app_photo_look_set((camera_app_photo_look_get() + 1) % CAM_LOOK_COUNT);
+            else
+                camera_app_photo_wb_set((camera_app_photo_wb_get() + 1) % CAM_WB_COUNT);
+            redraw();
+            continue;
+        }
+        if (g_btTOPstate || g_btDownstate) {      /* TOP/DOWN = 换行 */
+            g_btTOPstate = g_btDownstate = 0;
+            sel = (sel + 1) % 3;
+            redraw();
+            continue;
+        }
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
+}
+
+static int s_setSel = 0;                 /* 0=WiFi setup  1=Theme  2=Photo */
 
 static void settings_draw(Drawer& g)
 {
@@ -809,9 +903,9 @@ static void settings_draw(Drawer& g)
     ui_bar(g, 22, 92, 276, pT ? (float)(pT - pF) / (float)pT : 0, th->ok);
 
     /* ---- 系统信息卡片 ---- */
-    ui_card(g, 10, 108, 300, 64, th->surface);
+    ui_card(g, 10, 108, 300, 60, th->surface);
     auto row = [&](int i, const char* label, const String& value, uint16_t vc) {
-        int y = 116 + i * 14;
+        int y = 116 + i * 13;
         g.setTextDatum(TL_DATUM);
         g.setTextColor(th->muted, th->surface);
         g.drawString(label, 22, y);
@@ -845,27 +939,31 @@ static void settings_draw(Drawer& g)
     row(3, "SD card", sd_app_is_ready() ? "ready" : "missing",
         sd_app_is_ready() ? th->ok : th->danger);
 
-    /* ---- WiFi 行 ---- */
+    /* ---- 拍照档位行（不进子页也知道当前设定） ---- */
     g.setTextDatum(TL_DATUM);
     g.setTextColor(th->muted, th->bg);
-    g.drawString("WiFi", 22, 180);
+    g.drawString("Camera", 22, 176);
     g.setTextDatum(TR_DATUM);
-    String ws = web_app_wifi_status_text();
-    g.setTextColor(ws.indexOf("OFF") >= 0 ? th->muted : th->warn, th->bg);
-    g.drawString(ws, 298, 180);
+    g.setTextColor(th->text, th->bg);
+    g.drawString(camera_app_photo_size_text(camera_app_photo_size_get()), 298, 176);
+    g.setTextDatum(TL_DATUM);
 
-    /* ---- 两个操作按钮 ---- */
+    /* ---- 三个操作按钮：WiFi / 主题 / 拍照 ---- */
     g.setTextDatum(MC_DATUM);
     g.setTextFont(1);
     g.setTextSize(1);
-    const char* act[2] = { "WiFi setup", g_themeDark ? "Theme: dark" : "Theme: light" };
-    for (int i = 0; i < 2; ++i) {
-        int x = i ? 162 : 10;
+    String ws = web_app_wifi_status_text();
+    char wifiBtn[16];
+    snprintf(wifiBtn, sizeof(wifiBtn), "WiFi %s",
+             ws.indexOf("OFF") >= 0 ? "OFF" : "ON");
+    const char* act[3] = { wifiBtn, g_themeDark ? "Dark" : "Light", "Photo" };
+    for (int i = 0; i < 3; ++i) {
+        int x = 10 + i * 102;
         bool on = (s_setSel == i);
-        g.fillRoundRect(x, 198, 148, 22, 8, on ? th->selBg : th->surface);
-        g.drawRoundRect(x, 198, 148, 22, 8, on ? th->accent : th->line);
+        g.fillRoundRect(x, 190, 96, 22, 8, on ? th->selBg : th->surface);
+        g.drawRoundRect(x, 190, 96, 22, 8, on ? th->accent : th->line);
         g.setTextColor(on ? th->accent : th->muted, on ? th->selBg : th->surface);
-        g.drawString(act[i], x + 74, 209);
+        g.drawString(act[i], x + 48, 201);
     }
     g.setTextDatum(TL_DATUM);
 }
@@ -886,8 +984,11 @@ static void ui_settings_loop(void)
             if (s_setSel == 0) {
                 ui_wifi_loop();
                 g_btTOPstate = g_btDownstate = 0;  /* 清子界面残留按键标志 */
-            } else {
+            } else if (s_setSel == 1) {
                 theme_toggle();                    /* 深/浅色切换，NVS 掉电保持 */
+            } else {
+                ui_photo_loop();                   /* 拍照分辨率 / 色彩风格 */
+                g_btTOPstate = g_btDownstate = 0;
             }
             redraw();
             lastUpd = millis();
@@ -895,7 +996,7 @@ static void ui_settings_loop(void)
         }
         if (g_btTOPstate || g_btDownstate) {       /* TOP/DOWN 换焦点 */
             g_btTOPstate = g_btDownstate = 0;
-            s_setSel ^= 1;
+            s_setSel = (s_setSel + 1) % 3;
             redraw();
             continue;
         }

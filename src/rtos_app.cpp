@@ -503,7 +503,8 @@ static void serialCmdPoll(void)
                     if (v < -2) v = -2;
                     if (v > (w == "wb" ? 4 : 2)) v = (w == "wb" ? 4 : 2);
                     if (w == "ae") { s->set_ae_level(s, v); Serial.printf("[CMD] ae_level=%d\n", v); }
-                    if (w == "wb") { s->set_wb_mode(s, v); Serial.printf("[CMD] wb_mode=%d\n", v); }
+                    /* wb 走档位接口：立即生效 + 写 NVS（拍照重新 init 后不会被覆盖） */
+                    if (w == "wb") { camera_app_photo_wb_set(v); Serial.printf("[CMD] wb_mode=%d（已存 NVS）\n", v); }
                     if (w == "sat") { s->set_saturation(s, v); Serial.printf("[CMD] saturation=%d\n", v); }
                 }
             } else if (cmd == "snap") {

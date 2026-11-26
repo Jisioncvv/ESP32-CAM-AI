@@ -27,6 +27,7 @@ void setup()
     Serial.println("================ ESP32-S3 Camera System 启动 ================");
 
     theme_init();       /* 主题（深色/浅色）从 NVS 读回，后面所有界面都用它 */
+    camera_app_load_prefs();   /* 拍照分辨率/色彩档位从 NVS 读回（设置 App 可改） */
 
     /* 先点亮屏幕，后续状态直接显示在屏上 */
     lcd_app_init();

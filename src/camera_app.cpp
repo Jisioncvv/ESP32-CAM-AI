@@ -20,6 +20,7 @@
 #include "lcd_app.h"
 #include "ui_app.h"
 #include <SD.h>
+#include <Preferences.h>
 #include <WiFi.h>    /* 拍照档位自适应：WiFi 在线时 QSXGA DMA 会被挤死 */
 #include "web_app.h" /* web_app_wifi_busy：WiFi 连接中拍照降 UXGA（竞态） */
 
@@ -28,6 +29,116 @@ bool g_cameraReady = false;
 /* 官方同名全局：摄像头配置结构体与传感器指针 */
 static camera_config_t config;
 static sensor_t* sensor = nullptr;
+
+/* =====================================================================
+ * 拍照档位（分辨率 / 色彩风格）：NVS namespace "cam"
+ * ---------------------------------------------------------------------
+ * [为什么要按 4:3] OV5640 感光面是 4:3，16:9 输出是传感器内部上下裁切，
+ * 视场比肉眼看到的窄，且相册全屏 320x240 也是 4:3 → 16:9 照片上下留黑边。
+ * =================================================================== */
+static const framesize_t kPhotoFs[CAM_PSZ_COUNT] = {
+    FRAMESIZE_HD,      /* 1280x720  16:9  —— 上下裁切，视场比肉眼窄 */
+    FRAMESIZE_XGA,     /* 1024x768   4:3  —— 全画幅，实测 3.6s（默认） */
+    FRAMESIZE_SXGA,    /* 1280x1024  4:3  —— 高画质，但帧率断崖 → 约 12s */
+};
+static const char* kPhotoFsText[CAM_PSZ_COUNT] = {
+    "HD 1280x720",
+    "XGA 1024x768",
+    "SXGA 1280x1024",
+};
+/* 实测前台耗时（2026-11-26 上板测试）：
+ *   HD   3.55s（14fps，AWB 丢 10 帧仅 718ms）
+ *   XGA  3.6s （15fps，同量级 —— 4:3 里最优解）
+ *   SXGA 11.4s（0.45fps 断崖：1280x1024 的 VTS 配置让帧时间涨到 2.2s，
+ *              AWB 只能丢 1 帧，收敛不充分且慢，故不推荐） */
+static const int kPhotoFsSec[CAM_PSZ_COUNT] = { 4, 4, 12 };
+
+/* 白平衡档位：Auto 用硬件 AWB；其余为 OV5640 固定预设
+ * [为什么需要] 暗光/单色场景下 AWB 找不到中性参考，会整屏偏紫或偏蓝
+ * （实测 XGA 低照度 B/G=1.34）。固定预设能让颜色立刻稳定，由用户挑最像肉眼的 */
+static const char* kWbText[CAM_WB_COUNT] = { "Auto", "Sunny", "Cloudy", "Office", "Home" };
+
+static const char* kLookText[CAM_LOOK_COUNT] = { "Natural", "Vivid" };
+
+static int s_pszIdx  = 1;   /* 默认 XGA：4:3 全画幅 + 拍照约 3.6s */
+static int s_lookIdx = 0;   /* 默认 Natural：贴近肉眼 */
+static int s_wbIdx   = 0;   /* 默认 Auto */
+
+void camera_app_load_prefs(void)
+{
+    Preferences p;
+    /* [坑] 首次运行 NVS 里没有 "cam" namespace，begin() 会失败；
+     * 旧写法直接 return → g_photoFs 停在编译期初值，设置页显示 XGA
+     * 但实际仍按 SXGA 拍（12s）。所以无论 NVS 是否存在都要走到末尾同步 */
+    if (p.begin("cam", true)) {
+        s_pszIdx  = p.getUChar("psz",  1);
+        s_lookIdx = p.getUChar("look", 0);
+        s_wbIdx   = p.getUChar("wb",   0);
+        p.end();
+    }
+    if (s_pszIdx  < 0 || s_pszIdx  >= CAM_PSZ_COUNT)  s_pszIdx  = 1;
+    if (s_lookIdx < 0 || s_lookIdx >= CAM_LOOK_COUNT) s_lookIdx = 0;
+    if (s_wbIdx   < 0 || s_wbIdx   >= CAM_WB_COUNT)   s_wbIdx   = 0;
+    g_photoFs = (int)kPhotoFs[s_pszIdx];
+    Serial.printf("[CAM] 拍照档位：%s / %s / WB=%s\n",
+                  kPhotoFsText[s_pszIdx], kLookText[s_lookIdx], kWbText[s_wbIdx]);
+}
+
+int camera_app_photo_size_get(void) { return s_pszIdx; }
+
+void camera_app_photo_size_set(int idx)
+{
+    if (idx < 0 || idx >= CAM_PSZ_COUNT) return;
+    s_pszIdx = idx;
+    g_photoFs = (int)kPhotoFs[idx];
+    Preferences p;
+    if (p.begin("cam", false)) { p.putUChar("psz", (uint8_t)idx); p.end(); }
+    Serial.printf("[CAM] 拍照分辨率 → %s\n", kPhotoFsText[idx]);
+}
+
+const char* camera_app_photo_size_text(int idx)
+{
+    return (idx >= 0 && idx < CAM_PSZ_COUNT) ? kPhotoFsText[idx] : "-";
+}
+
+int camera_app_photo_size_est_sec(int idx)
+{
+    return (idx >= 0 && idx < CAM_PSZ_COUNT) ? kPhotoFsSec[idx] : 0;
+}
+
+int camera_app_photo_look_get(void) { return s_lookIdx; }
+
+void camera_app_photo_look_set(int idx)
+{
+    if (idx < 0 || idx >= CAM_LOOK_COUNT) return;
+    s_lookIdx = idx;
+    Preferences p;
+    if (p.begin("cam", false)) { p.putUChar("look", (uint8_t)idx); p.end(); }
+    camera_app_apply_soft_config();     /* 立即生效（预览同步变） */
+    Serial.printf("[CAM] 色彩风格 → %s\n", kLookText[idx]);
+}
+
+const char* camera_app_photo_look_text(int idx)
+{
+    return (idx >= 0 && idx < CAM_LOOK_COUNT) ? kLookText[idx] : "-";
+}
+
+int camera_app_photo_wb_get(void) { return s_wbIdx; }
+
+void camera_app_photo_wb_set(int idx)
+{
+    if (idx < 0 || idx >= CAM_WB_COUNT) return;
+    s_wbIdx = idx;
+    Preferences p;
+    if (p.begin("cam", false)) { p.putUChar("wb", (uint8_t)idx); p.end(); }
+    camera_app_apply_soft_config();     /* 立即生效（预览同步变） */
+    Serial.printf("[CAM] 白平衡 → %s\n", kWbText[idx]);
+}
+
+const char* camera_app_photo_wb_text(int idx)
+{
+    return (idx >= 0 && idx < CAM_WB_COUNT) ? kWbText[idx] : "-";
+}
 
 /* =====================================================================
  * 官方 cameraTask_InitCameraConfig —— 回退用预览配置（RGB565 QVGA）
@@ -122,15 +233,31 @@ void camera_app_apply_soft_config(void)
     sensor->set_raw_gma(sensor, 1);    /* 传感器 gamma 曲线 */
     sensor->set_aec2(sensor, 1);       /* AEC2：宽动态，强光不过曝 */
     sensor->set_awb_gain(sensor, 1);   /* AWB 增益 */
-    sensor->set_wb_mode(sensor, 0);    /* 自动白平衡 */
+    /* 白平衡：0=Auto（硬件 AWB）/ 1=Sunny / 2=Cloudy / 3=Office / 4=Home
+     * 暗光或单色场景 AWB 找不到中性参考会整屏偏紫（实测 B/G=1.34），
+     * 固定预设可让颜色稳定 —— 设置 App → Photo → White balance 可切 */
+    sensor->set_wb_mode(sensor, s_wbIdx);
 
-    /* ---- 观感增强（手机直出风格） ----
-     * [偏红修复] 实测饱和度 +1 会放大 AWB 收敛残差（画面明显偏红），回落到 0；
-     * AWB 落定前的过渡帧由 camera_app_settle_awb() 丢弃，不再依赖饱和度掩盖 */
-    sensor->set_contrast(sensor, 1);     /* -2..2：对比度 +1 */
-    sensor->set_saturation(sensor, 0);   /* -2..2：饱和度默认（+1 会放大偏红） */
-    sensor->set_sharpness(sensor, 2);    /* -2..2：锐化 +2 */
-    sensor->set_denoise(sensor, 2);      /* 降噪加强（暗光高增益噪点明显） */
+    /* ---- 观感增强 ----
+     * [色彩修复 2026-11-26] 旧参数 contrast=1 / sharpness=2 / denoise=2 是
+     * "手机直出味"的激进组合，实测在 1280x720 下有三个副作用：
+     *   ① sharpness=2（最强锐化）会在边缘拉出白边、暗部出现密集颗粒；
+     *   ② denoise=2 把细节抹平，人物/衣物像塑料；
+     *   ③ contrast=1 压暗部，白墙(高光)反而更灰 —— 就是"和肉眼不一样"的观感来源。
+     * 用户诉求是"像肉眼看到的"，所以 Natural 档回到传感器中性值（0/1/1/0），
+     * Vivid 档才用增强参数（供想要"出片感"时切换）。
+     * 注意：饱和度 +1 会放大 AWB 收敛残差（旧版实测偏红），故 Natural 保持 0。 */
+    if (s_lookIdx == 0) {
+        sensor->set_contrast(sensor, 0);     /* -2..2：不加对比，保留暗部层次 */
+        sensor->set_saturation(sensor, 0);   /* -2..2：中性饱和度（最接近肉眼） */
+        sensor->set_sharpness(sensor, 1);    /* 轻度锐化：有细节但不拉白边 */
+        sensor->set_denoise(sensor, 1);      /* 轻度降噪：不涂抹纹理 */
+    } else {
+        sensor->set_contrast(sensor, 1);
+        sensor->set_saturation(sensor, 1);
+        sensor->set_sharpness(sensor, 2);
+        sensor->set_denoise(sensor, 1);
+    }
     /* 限制自动增益上限：默认会一路拉满产生密集彩色噪点；
      * 16X 上限换取更干净的暗部（代价：极暗场景画面会略暗） */
     sensor->set_gainceiling(sensor, GAINCEILING_16X);
@@ -152,6 +279,34 @@ void camera_app_settle_awb(uint8_t frames)
         if (fb) esp_camera_fb_return(fb);
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+}
+
+/* =====================================================================
+ * [色彩修复核心] 拍照前的 AWB/AEC 收敛窗口
+ * ---------------------------------------------------------------------
+ * 现象：同一场景连拍几张，白墙忽而正常、忽而发紫发粉（实测 R/G 在 1.05~1.34
+ * 之间跳）。根因不是传感器坏了，而是拍照流程 deinit→init 后 AWB/AEC 的
+ * 统计窗口从零开始，旧代码只丢 1 帧预热帧就抓大图 —— 抓到的是"上一场景
+ * 残留增益 + 首帧空统计"的画面，白平衡根本没落定。
+ * 修法：抓图前按时间预算连续丢帧，让 AWB/AEC 用真实场景统计收敛。
+ *   小分辨率帧率高（HD ~8fps）→ 900ms 能丢 7 帧，够收敛；
+ *   大分辨率帧率极低（UXGA 每帧 >1s）→ 只靠时间预算，不硬等帧数。
+ * =================================================================== */
+static void photo_settle_ae_awb(framesize_t fs)
+{
+    uint32_t budget = (fs >= FRAMESIZE_UXGA) ? 1400 : 900;
+    uint8_t  maxDrop = (fs >= FRAMESIZE_UXGA) ? 3 : 10;
+    uint32_t t0 = millis();
+    uint8_t n = 0;
+    while (n < maxDrop && millis() - t0 < budget) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
+        esp_camera_fb_return(fb);
+        ++n;
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+    Serial.printf("[PHOTO] AWB/AEC 收敛：丢 %u 帧 / %ums\n",
+                  (unsigned)n, (unsigned)(millis() - t0));
 }
 
 /* =====================================================================
@@ -386,7 +541,7 @@ static String next_photo_path(void)
  * （QSXGA 15.7s / SXGA 15.3s 全部拍空），故必须保留 fb_count=2。
  * 保留的两处提速：① 去掉拍照路径的 tune_pll ② 预热帧与主帧之间不等待。
  * 默认 SXGA 1280x1024：实测 6.0s（QSXGA 10~14s、UXGA 12s），130 万像素。 */
-volatile int g_photoFs = FRAMESIZE_HD;
+volatile int g_photoFs = FRAMESIZE_XGA;    /* 默认 4:3 全画幅；实际值由 NVS 档位覆盖 */
 bool camera_app_photo_save(String* photoPath)
 {
     uint32_t tAll = millis();                /* 总耗时统计（优化照片流程用） */
@@ -440,6 +595,8 @@ bool camera_app_photo_save(String* photoPath)
         /* 预热帧：吸收 init 后的首帧延迟 */
         camera_fb_t* warm = esp_camera_fb_get();
         if (warm) esp_camera_fb_return(warm);
+        /* [色彩修复] 再丢一段收敛帧：没有它，AWB 空统计抓图 → 白墙忽紫忽黄 */
+        photo_settle_ae_awb(targetFs);
         g_cameraReady = true;            /* 拍照配置已就绪（驱动在线） */
         g_cameraPhotoCfg = true;
     }
