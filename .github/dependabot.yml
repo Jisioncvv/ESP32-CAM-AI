@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # 让 GitHub Actions 的版本跟随官方发布自动升级，避免 action 被弃用后 CI 突然挂掉
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "chore(ci)"

@@ -1,0 +1,13 @@
+# 交由 git 自动判定文本文件（行尾按各平台检出，仓库内统一存 LF）
+* text=auto
+
+# 二进制文件不做行尾与文本合并处理
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.bin   binary
+*.gif   binary
+*.pdf   binary
+
+# 生成物不参与 diff 统计
+docs/ui-preview/*.png linguist-documentation
