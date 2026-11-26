@@ -20,22 +20,32 @@ const Theme themeDark = {
     /* ok       */ 0x5E54,   /* #5DCAA5 */
     /* warn     */ 0xECE4,   /* #EF9F27 */
     /* danger   */ 0xF36D,   /* #F26D6D */
+    /* selBg    */ 0x21CB,   /* #22395C 比 surface2 亮一档，焦点清楚 */
+    /* osd      */ 0x08C5,   /* #0F1A2E OSD 底衬＝标题栏色 */
+    /* osdTx    */ 0xEF7F,   /* #E8EEF9 */
     /* dark     */ true
 };
 
+/* 浅色配色：为 8px 字模做过对比度校准
+ *   - muted 由 #6B7A93 加深到 #55627A（小字在白底上才不"发灰"）
+ *   - header 不再纯白：白底页面里的顶/底栏会和卡片糊在一起，改成淡蓝灰
+ *   - selBg 浅青 #D8EDF6：与 surface(#FFF) 明确区分，选中项一眼可见 */
 const Theme themeLight = {
-    /* bg       */ 0xF7BF,   /* #F4F6FB */
+    /* bg       */ 0xF7BF,   /* #F2F5FA */
     /* surface  */ 0xFFFF,   /* #FFFFFF */
-    /* surface2 */ 0xEF9F,   /* #EEF2F9 */
-    /* header   */ 0xFFFF,   /* #FFFFFF */
-    /* line     */ 0xDEFD,   /* #D8DFEA */
+    /* surface2 */ 0xEF7E,   /* #E8EEF7 */
+    /* header   */ 0xE75E,   /* #E4EBF6 */
+    /* line     */ 0xCEDD,   /* #CFD9E8 */
     /* text     */ 0x1107,   /* #16203A */
-    /* muted    */ 0x6BD2,   /* #6B7A93 */
+    /* muted    */ 0x530F,   /* #55627A */
     /* accent   */ 0x0BB2,   /* #0E7490 */
     /* accentTx */ 0xFFFF,   /* #FFFFFF */
-    /* ok       */ 0x0B6A,   /* #0F6E56 */
-    /* warn     */ 0xB281,   /* #B45309 */
-    /* danger   */ 0xB8E3,   /* #B91C1C */
+    /* ok       */ 0x0B4A,   /* #0B6B52 */
+    /* warn     */ 0x9A40,   /* #9A4A05 */
+    /* danger   */ 0xB123,   /* #B3261E */
+    /* selBg    */ 0xDF7E,   /* #D8EDF6 */
+    /* osd      */ 0xE75E,   /* #E4EBF6 OSD 底衬跟随主题（浅色=浅底深字） */
+    /* osdTx    */ 0x1107,   /* #16203A */
     /* dark     */ false
 };
 

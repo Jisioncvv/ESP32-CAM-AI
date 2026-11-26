@@ -33,6 +33,13 @@ struct Theme {
     uint16_t ok;
     uint16_t warn;
     uint16_t danger;
+    /* [选中色独立] 之前用 surface2 当选中底色，浅色主题下 surface2(#E8EEF7)
+     * 与 surface(#FFF) 几乎同色，"选中"只剩一圈 1px 描边，看不出焦点。
+     * 现在单独给 selBg：深色=偏亮的蓝，浅色=浅青，和普通行拉开明显差距 */
+    uint16_t selBg;
+    /* 相机 OSD（叠在实时画面上）：底衬 + 文字，跟随主题而非硬编码黄/黑 */
+    uint16_t osd;
+    uint16_t osdTx;
     bool     dark;
 };
 
@@ -62,6 +69,13 @@ struct Drawer {
     void fillCircle(int x,int y,int r,uint16_t c) { if (s) s->fillCircle(x,y,r,c); else t->fillCircle(x,y,r,c); }
 
     void setTextColor(uint16_t fg, uint16_t bg) { if (s) s->setTextColor(fg,bg); else t->setTextColor(fg,bg); }
+    void setCursor(int x, int y)                { if (s) s->setCursor(x,y);    else t->setCursor(x,y); }
+    void print(const String& str) {
+        if (s) s->print(str); else t->print(str);
+    }
+    int  textWidth(const String& str) {
+        return s ? s->textWidth(str) : t->textWidth(str);
+    }
     void setTextDatum(uint8_t d)                { if (s) s->setTextDatum(d);    else t->setTextDatum(d); }
     void setTextFont(uint8_t f)                 { if (s) s->setTextFont(f);     else t->setTextFont(f); }
     void setTextSize(uint8_t sz)                { if (s) s->setTextSize(sz);    else t->setTextSize(sz); }
@@ -128,7 +142,7 @@ inline void ui_footer(Drawer& g, const char* hint)
 inline void ui_row(Drawer& g, int x, int y, int w, int h, bool sel)
 {
     const Theme* th = g_th;
-    g.fillRoundRect(x, y, w, h, 10, sel ? th->surface2 : th->surface);
+    g.fillRoundRect(x, y, w, h, 10, sel ? th->selBg : th->surface);
     if (sel) {
         g.drawRoundRect(x, y, w, h, 10, th->accent);
         g.fillRoundRect(x + 3, y + 8, 3, h - 16, 2, th->accent);
@@ -150,4 +164,33 @@ inline void ui_bar(Drawer& g, int x, int y, int w, float ratio, uint16_t color)
     g.fillRoundRect(x, y, w, 5, 2, th->surface2);
     int fw = (int)(w * ratio);
     if (fw >= 3) g.fillRoundRect(x, y, fw, 5, 2, color);
+}
+
+/* =====================================================================
+ * 相机 OSD 小标签（fps / WiFi / SAVE）
+ * ---------------------------------------------------------------------
+ * 叠在实时画面上必须自带底衬：纯色文字遇到同色画面就看不见了。
+ * 底衬用 osd（深色主题=标题栏深底，浅色主题=浅底），文字用主题色，
+ * 两套主题下都是"本主题的配色"，不再硬编码 TFT_YELLOW / TFT_BLACK。
+ * =================================================================== */
+#define UI_OSD_H 14
+inline int ui_osd_width(const char* txt)
+{
+    return (int)strlen(txt) * 6 + 10;
+}
+inline void ui_osd_chip(Drawer& g, int x, int y, const char* txt, uint16_t fg)
+{
+    const Theme* th = g_th;
+    int w = ui_osd_width(txt);
+    g.fillRoundRect(x, y, w, UI_OSD_H, 7, th->osd);
+    g.drawRoundRect(x, y, w, UI_OSD_H, 7, th->line);   /* 亮画面上也能分开 */
+    g.setTextDatum(TL_DATUM);
+    g.setTextFont(1);
+    g.setTextSize(1);
+    g.setTextColor(fg, th->osd);
+    g.drawString(txt, x + 5, y + 3);
+}
+inline void ui_osd_chip_right(Drawer& g, int right, int y, const char* txt, uint16_t fg)
+{
+    ui_osd_chip(g, right - ui_osd_width(txt), y, txt, fg);
 }

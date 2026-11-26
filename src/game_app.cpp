@@ -96,7 +96,7 @@ static void menuDraw(Drawer& g, int sel)
     for (int i = 0; i < GAME_COUNT; ++i) {
         int y = 36 + i * 58;
         bool on = (i == sel);
-        uint16_t rowBg = on ? th->surface2 : th->surface;
+        uint16_t rowBg = on ? th->selBg : th->surface;
         ui_row(g, 10, y, 300, 50, on);
 
         /* 图标块 */

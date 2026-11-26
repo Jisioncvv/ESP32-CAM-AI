@@ -204,7 +204,7 @@ static void draw_desktop_frame(float off, int dbgStage = 0)
         int x = sx[i], y = sy[i], s = ss[i];
         bool full = (x >= 0 && x + s <= 320);           /* 完整可见才画图标/边框 */
         bool selp = (i == center);
-        uint16_t tile = selp ? th->surface2 : th->surface;
+        uint16_t tile = selp ? th->selBg : th->surface;
         g.tileBody(x, y, s, s, selp ? 12 : 10, tile);
         if (!th->dark && full)                          /* 浅色主题：瓷片需要描边 */
             g.drawRoundRect(x, y, s, s, selp ? 12 : 10, th->line);
@@ -352,204 +352,267 @@ static String kb_key_label(int k)
     return String(pg[s_kbPage][row][col]);
 }
 
-/* 画单个按键（统一白底风格：选中=深蓝底白字，普通=浅灰底深字，Connect 绿） */
-static void kb_draw_key(int k, bool sel)
+/* =====================================================================
+ * WiFi 子界面绘制（全部走主题 token + Sprite 合成）
+ * ---------------------------------------------------------------------
+ * [历史 bug] 主题迁移时把这里改成了 "fg=muted / bg=text" 的写法：
+ *   浅色主题下 text 是深藏青 → 文字后面出现一块深色补丁，
+ *   再配上 muted 灰字直接看不清；小键盘选中键更离谱，fg 和 bg 都取了
+ *   text（同色），按下的键整个"消失"。
+ * 现在统一为：文字 = text/muted，底色 = bg/selBg/surface，选中 = accent。
+ * 另外改为画进复用 Sprite 再整帧推屏，和设置/游戏/备忘同一条路径。
+ * =================================================================== */
+static inline Drawer ui_spr(void)
+{
+    return Drawer{ lcd_app_get_spr(), &tft };
+}
+static inline void ui_push(Drawer& g)
+{
+    if (g.s) g.s->pushSprite(0, 0);
+}
+
+/* 画单个按键：选中=强调色实心，Connect=成功色，其余=卡片白底 + 描边 */
+static void kb_draw_key(Drawer& g, int k, bool sel)
 {
     int x, y, w, h; kb_key_rect(k, x, y, w, h);
-    uint16_t bg = sel ? g_th->text
-                : (k == 44) ? 0x03E0
-                : (k == 43) ? 0xD69A : 0xE71C;
-    uint16_t fg = sel ? g_th->text
-                : (k == 44) ? g_th->text : g_th->text;
-    tft.fillRect(x + 1, y + 1, w - 2, h - 2, bg);
-    tft.setTextColor(fg, bg);
-    tft.setTextSize(1);
-    tft.setTextDatum(MC_DATUM);
-    tft.drawCentreString(kb_key_label(k), x + w / 2, y + h / 2, 2);
-    tft.setTextDatum(TL_DATUM);
+    const Theme* th = g_th;
+    uint16_t bg, fg;
+    if (sel)          { bg = th->accent;   fg = th->accentTx; }
+    else if (k == 44) { bg = th->ok;       fg = th->accentTx; }
+    else if (k == 43) { bg = th->surface2; fg = th->muted; }
+    else              { bg = th->surface;  fg = th->text; }
+
+    g.fillRect(x, y, w, h, th->bg);          /* 先清底：圆角处不留旧色 */
+    g.fillRoundRect(x + 1, y + 1, w - 2, h - 2, 5, bg);
+    if (k != 44) g.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 5, th->line);
+    g.setTextColor(fg, bg);
+    g.setTextSize(1);
+    g.setTextDatum(MC_DATUM);
+    g.drawCentreString(kb_key_label(k), x + w / 2, y + h / 2, 2);
+    g.setTextDatum(TL_DATUM);
 }
 
-/* 密码行原位刷新（含光标 _，白底深字统一风格） */
-static void kb_draw_pass(void)
+/* 密码行原位刷新（卡片底 + 主文字，光标用强调色竖条） */
+static void kb_draw_pass(Drawer& g)
 {
-    tft.fillRect(0, 24, 320, 20, g_th->surface);
-    tft.drawFastHLine(0, 44, 320, g_th->surface2);
-    tft.setTextSize(2);
-    tft.setTextFont(2);
-    tft.setTextColor(g_th->text, g_th->surface);
-    tft.setCursor(4, 26);
+    const Theme* th = g_th;
+    g.fillRect(0, 24, 320, 21, th->surface);
+    g.drawFastHLine(0, 45, 320, th->line);
+    g.setTextFont(2);
+    g.setTextSize(1);
+    g.setTextColor(th->text, th->surface);
+    g.setCursor(6, 28);
     String d = s_wPass;
     if (d.length() > 25) d = d.substring(d.length() - 25);   /* 长密码显示尾部 */
-    tft.print(d + "_");
-    tft.setTextSize(1);
+    g.print(d);
+    int cx = 6 + g.textWidth(d);
+    if (cx > 310) cx = 310;
+    g.fillRect(cx + 1, 28, 2, 14, th->accent);              /* 光标 */
 }
 
-/* 小键盘整屏（白底 + 深蓝顶栏，与桌面/设置统一） */
+/* 小键盘整屏：标题栏 + 密码行 + 45 键 + 底栏提示 */
 static void kb_draw_screen(void)
 {
-    tft.fillScreen(g_th->bg);
-    tft.fillRect(0, 0, 320, 22, g_th->header);
-    tft.setTextSize(1);
-    tft.setTextFont(2);
-    tft.setTextColor(g_th->text, g_th->header);
-    tft.setCursor(4, 4);
+    Drawer g = ui_spr();
+    const Theme* th = g_th;
+    g.fillScreen(th->bg);
+    g.fillRect(0, 0, 320, 24, th->header);
+    g.drawFastHLine(0, 23, 320, th->line);
+    g.setTextSize(1);
+    g.setTextDatum(TL_DATUM);
+    g.setTextFont(2);
+    g.setTextColor(th->text, th->header);
+    g.setCursor(10, 5);
     String t = s_wCurSsid;
     if (t.length() > 24) t = t.substring(0, 24);
-    tft.print("Password: " + t);
-    tft.setTextFont(1);
-    kb_draw_pass();
-    for (int k = 0; k < 45; ++k) kb_draw_key(k, k == s_kbCur);
-    tft.setTextColor(g_th->muted, g_th->surface);
-    tft.setCursor(4, 216);
-    tft.print("TOP/DN=move(hold=fast)  CAM=select  MID=cancel");
+    g.print("Password: " + t);
+
+    kb_draw_pass(g);
+    for (int k = 0; k < 45; ++k) kb_draw_key(g, k, k == s_kbCur);
+
+    g.fillRect(0, 216, 320, 24, th->header);
+    g.drawFastHLine(0, 216, 320, th->line);
+    g.setTextFont(1);
+    g.setTextColor(th->muted, th->header);
+    g.setTextDatum(MC_DATUM);
+    g.drawString("TOP/DN move   CAM select   MID cancel", 160, 228);
+    g.setTextDatum(TL_DATUM);
+    ui_push(g);
 }
 
-/* ---- 扫描/连接/结果 页面（统一白底 + 深蓝顶栏） ---- */
+/* ---- 扫描 / 连接 / 结果页 ---- */
+static void wifi_page_header(Drawer& g, const char* title, uint16_t bgc, uint16_t fgc)
+{
+    const Theme* th = g_th;
+    g.fillRect(0, 0, 320, 24, bgc);
+    g.drawFastHLine(0, 23, 320, th->line);
+    g.setTextFont(2);
+    g.setTextSize(1);
+    g.setTextDatum(TL_DATUM);
+    g.setTextColor(fgc, bgc);
+    g.setCursor(10, 5);
+    g.print(title);
+}
+
+static void wifi_page_footer(Drawer& g, const char* hint)
+{
+    const Theme* th = g_th;
+    g.fillRect(0, 216, 320, 24, th->header);
+    g.drawFastHLine(0, 216, 320, th->line);
+    g.setTextFont(1);
+    g.setTextColor(th->muted, th->header);
+    g.setTextDatum(MC_DATUM);
+    g.drawString(hint, 160, 228);
+    g.setTextDatum(TL_DATUM);
+}
+
 static void wifi_scan_wait_draw(void)
 {
-    tft.fillScreen(g_th->bg);
-    tft.fillRect(0, 0, 320, 22, g_th->header);
-    tft.setTextFont(2);
-    tft.setTextSize(1);
-    tft.setTextColor(g_th->text, g_th->header);
-    tft.setCursor(6, 4);
-    tft.print("WiFi Setup");
-    tft.setTextFont(1);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(g_th->text, g_th->surface);
-    tft.drawString("Scanning WiFi...", 160, 100);
-    tft.setTextColor(g_th->muted, g_th->surface);
-    tft.drawString("2.4GHz, about 3 seconds", 160, 128);
-    tft.setTextDatum(TL_DATUM);
+    Drawer g = ui_spr();
+    const Theme* th = g_th;
+    g.fillScreen(th->bg);
+    wifi_page_header(g, "WiFi Setup", th->header, th->text);
+    g.setTextFont(2);
+    g.setTextDatum(MC_DATUM);
+    g.setTextColor(th->text, th->bg);
+    g.drawString("Scanning WiFi...", 160, 100);
+    g.setTextFont(1);
+    g.setTextColor(th->muted, th->bg);
+    g.drawString("2.4GHz, about 3 seconds", 160, 128);
+    g.setTextDatum(TL_DATUM);
+    ui_push(g);
 }
 
 static void wifi_conn_draw(const String& ssid)
 {
-    tft.fillScreen(g_th->bg);
-    tft.fillRect(0, 0, 320, 22, g_th->header);
-    tft.setTextFont(2);
-    tft.setTextSize(1);
-    tft.setTextColor(g_th->text, g_th->header);
-    tft.setCursor(6, 4);
-    tft.print("Connecting...");
-    tft.setTextFont(1);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(g_th->text, g_th->surface);
+    Drawer g = ui_spr();
+    const Theme* th = g_th;
+    g.fillScreen(th->bg);
+    wifi_page_header(g, "Connecting...", th->header, th->text);
+    g.setTextFont(2);
+    g.setTextDatum(MC_DATUM);
+    g.setTextColor(th->text, th->bg);
     String t = ssid;
     if (t.length() > 20) t = t.substring(0, 20);
-    tft.drawString(t, 160, 104);
-    tft.setTextColor(g_th->muted, g_th->surface);
-    tft.drawString("please wait (up to 15s)", 160, 130);
-    tft.setTextDatum(TL_DATUM);
+    g.drawString(t, 160, 104);
+    g.setTextFont(1);
+    g.setTextColor(th->muted, th->bg);
+    g.drawString("please wait (up to 15s)", 160, 130);
+    g.setTextDatum(TL_DATUM);
+    ui_push(g);
 }
 
 static void wifi_result_draw(bool ok, const String& info)
 {
-    tft.fillScreen(g_th->bg);
-    tft.fillRect(0, 0, 320, 22, ok ? 0x03E0 : 0xE71C);
-    tft.setTextFont(2);
-    tft.setTextSize(1);
-    tft.setTextColor(ok ? g_th->text : g_th->text, ok ? 0x03E0 : 0xE71C);
-    tft.setCursor(6, 4);
-    tft.print(ok ? "Connected OK" : "Connect FAILED");
-    tft.setTextFont(1);
-    tft.setTextDatum(MC_DATUM);
+    Drawer g = ui_spr();
+    const Theme* th = g_th;
+    g.fillScreen(th->bg);
+    wifi_page_header(g, ok ? "Connected OK" : "Connect FAILED",
+                     ok ? th->ok : th->danger, th->accentTx);
+    g.setTextDatum(MC_DATUM);
     if (ok) {
-        tft.setTextSize(2);
-        tft.setTextColor(g_th->text, g_th->surface);
-        tft.drawString("IP: " + info, 160, 100);
-        tft.setTextSize(1);
-        tft.setTextColor(g_th->muted, g_th->surface);
-        tft.drawString("Browser (same WiFi) -> this IP", 160, 132);
+        g.setTextFont(2);
+        g.setTextColor(th->text, th->bg);
+        g.drawString("IP: " + info, 160, 100);
+        g.setTextFont(1);
+        g.setTextColor(th->muted, th->bg);
+        g.drawString("Browser (same WiFi) -> this IP", 160, 132);
     } else {
-        tft.setTextSize(1);
-        tft.setTextColor(TFT_RED, g_th->surface);
-        tft.drawString(info, 160, 108);
+        g.setTextFont(2);
+        g.setTextColor(th->danger, th->bg);
+        g.drawString(info, 160, 108);
     }
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(g_th->muted, g_th->surface);
-    tft.setCursor(4, 224);
-    tft.print("CAM/MID = back");
+    g.setTextDatum(TL_DATUM);
+    wifi_page_footer(g, "CAM/MID = back");
+    ui_push(g);
 }
 
-/* WiFi 主菜单（白底 iOS 风，与设置页一致） */
+/* ---- WiFi 主菜单 ---- */
 static void wifi_menu_draw(int sel)
 {
-    tft.fillScreen(g_th->bg);
-    tft.fillRect(0, 0, 320, 24, g_th->header);
-    tft.setTextFont(2);
-    tft.setTextSize(1);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(g_th->text, g_th->header);
-    tft.drawString("WiFi Setup", 160, 12);
-    tft.setTextDatum(TL_DATUM);
+    Drawer g = ui_spr();
+    const Theme* th = g_th;
+    g.fillScreen(th->bg);
+    wifi_page_header(g, "WiFi Setup", th->header, th->text);
 
     bool apOn = (WiFi.getMode() & WIFI_MODE_AP);
     const char* items[3] = { "Scan & Connect", "Connect Saved",
                              apOn ? "Hotspot Mode : ON" : "Hotspot Mode : OFF" };
     for (int i = 0; i < 3; ++i) {
-        int y = 42 + i * 36;
+        int y = 40 + i * 40;
+        uint16_t rowBg = (i == sel) ? th->selBg : th->surface;
+        g.fillRoundRect(10, y, 300, 32, 8, rowBg);
         if (i == sel) {
-            tft.fillRect(8, y - 6, 304, 30, g_th->surface2);
-            tft.drawRoundRect(8, y - 6, 304, 30, 6, g_th->header);
+            g.drawRoundRect(10, y, 300, 32, 8, th->accent);
+            g.fillRoundRect(14, y + 10, 3, 12, 2, th->accent);
+        } else {
+            g.drawRoundRect(10, y, 300, 32, 8, th->line);
         }
-        tft.setTextFont(2);
-        tft.setTextSize(1);
-        tft.setTextColor(i == sel ? g_th->text : g_th->muted,
-                         i == sel ? g_th->surface2 : g_th->text);
-        tft.setCursor(20, y);
-        tft.print(items[i]);
+        g.setTextFont(2);
+        g.setTextSize(1);
+        g.setTextColor(i == sel ? th->text : th->muted, rowBg);
+        g.setCursor(28, y + 8);
+        g.print(items[i]);
+        if (i == 2)                                   /* 状态点：开=绿 关=灰 */
+            g.fillCircle(296, y + 16, 4, apOn ? th->ok : th->line);
     }
-    tft.setTextColor(g_th->muted, g_th->surface);
-    tft.setCursor(20, 42 + 3 * 36);
-    tft.print("Status: " + web_app_wifi_status_text());
-    tft.fillRect(0, 224, 320, 16, g_th->header);
-    tft.setTextColor(g_th->text, g_th->header);
-    tft.setCursor(6, 227);
-    tft.print("TOP/DN=move  CAM=select  MID=back");
+
+    g.setTextFont(1);
+    g.setTextColor(th->muted, th->bg);
+    g.setCursor(14, 168);
+    g.print("WiFi: " + web_app_wifi_status_text());
+
+    wifi_page_footer(g, "TOP/DN move   CAM select   MID back");
+    ui_push(g);
 }
 
-/* 扫描结果列表（统一白底 + 深蓝顶栏，选中行浅灰高亮） */
+/* ---- 扫描结果列表 ---- */
 static void wifi_list_draw(int sel)
 {
-    tft.fillScreen(g_th->bg);
-    tft.fillRect(0, 0, 320, 22, g_th->header);
-    tft.setTextFont(2);
-    tft.setTextSize(1);
-    tft.setTextColor(g_th->text, g_th->header);
-    tft.setCursor(6, 4);
-    tft.print("WiFi List  " + String(s_wCount) + " found");
-    tft.setTextFont(1);
+    Drawer g = ui_spr();
+    const Theme* th = g_th;
+    g.fillScreen(th->bg);
+    wifi_page_header(g, ("WiFi List  " + String(s_wCount) + " found").c_str(),
+                     th->header, th->text);
 
     if (s_wCount == 0) {
-        tft.setTextDatum(MC_DATUM);
-        tft.setTextColor(g_th->muted, g_th->surface);
-        tft.drawString("No networks", 160, 108);
-        tft.setTextDatum(TL_DATUM);
+        g.setTextFont(2);
+        g.setTextDatum(MC_DATUM);
+        g.setTextColor(th->muted, th->bg);
+        g.drawString("No networks", 160, 108);
+        g.setTextDatum(TL_DATUM);
+        wifi_page_footer(g, "MID = back");
+        ui_push(g);
         return;
     }
     if (sel < s_wListTop) s_wListTop = sel;
-    if (sel > s_wListTop + 8) s_wListTop = sel - 8;
+    if (sel > s_wListTop + 7) s_wListTop = sel - 7;
     if (s_wListTop < 0) s_wListTop = 0;
-    for (int i = 0; i < 9 && s_wListTop + i < s_wCount; ++i) {
+    for (int i = 0; i < 8 && s_wListTop + i < s_wCount; ++i) {
         int idx = s_wListTop + i;
-        int y = 26 + i * 22;
+        int y = 28 + i * 23;
         bool s = (idx == sel);
-        if (s) tft.fillRect(4, y - 2, 312, 20, g_th->surface2);
-        tft.setTextColor(s ? g_th->text : g_th->muted, s ? g_th->surface2 : g_th->text);
-        tft.setCursor(8, y + 2);
+        uint16_t rowBg = s ? th->selBg : th->bg;
+        if (s) {
+            g.fillRoundRect(6, y, 308, 21, 6, rowBg);
+            g.drawRoundRect(6, y, 308, 21, 6, th->accent);
+        }
         String nm = s_wSsid[idx];
-        if (nm.length() > 22) nm = nm.substring(0, 22);
-        tft.print(nm.length() ? nm : String("(hidden)"));
-        tft.setCursor(220, y + 2);
-        tft.print(s_wOpen[idx] ? "OPEN" : "PWD");
-        tft.setCursor(262, y + 2);
-        tft.print(String(s_wRssi[idx]) + "dBm");
+        if (nm.length() > 20) nm = nm.substring(0, 20);
+        g.setTextFont(1);
+        g.setTextSize(1);
+        g.setTextColor(th->text, rowBg);
+        g.setCursor(14, y + 7);
+        g.print(nm.length() ? nm : String("(hidden)"));
+        g.setTextColor(s ? th->accent : th->muted, rowBg);
+        g.setCursor(226, y + 7);
+        g.print(s_wOpen[idx] ? "OPEN" : "PWD");
+        g.setCursor(266, y + 7);
+        g.print(String(s_wRssi[idx]));
     }
-    tft.fillRect(0, 226, 320, 14, g_th->header);
-    tft.setTextColor(g_th->text, g_th->header);
-    tft.setCursor(6, 229);
-    tft.print("TOP/DN=move  CAM=connect  MID=back");
+
+    wifi_page_footer(g, "TOP/DN move   CAM connect   MID back");
+    ui_push(g);
 }
 
 /* [长按加速] TOP/DOWN 原始电平轮询：首次按下立即移动 1 步；
@@ -645,17 +708,17 @@ static void ui_wifi_loop(void)
             } else if (state == W_KB) {                  /* 小键盘：选中键生效 */
                 if (s_kbCur == 0) {                      /* DEL 退格 */
                     if (s_wPass.length()) s_wPass.remove(s_wPass.length() - 1);
-                    kb_draw_pass();
+                    Drawer kg = ui_spr(); kb_draw_pass(kg); ui_push(kg);
                 } else if (s_kbCur == 1) {               /* CLR 清空 */
                     s_wPass = "";
-                    kb_draw_pass();
+                    Drawer kg = ui_spr(); kb_draw_pass(kg); ui_push(kg);
                 } else if (s_kbCur == 2) {               /* 页面循环：数字→abc→ABC→SYM */
                     s_kbPage = (s_kbPage + 1) % 4;
                     kb_draw_screen();
                 } else if (s_kbCur < 43) {               /* 字符键（密码上限 32） */
                     if (s_wPass.length() < 32) {
                         s_wPass += kb_key_label(s_kbCur);
-                        kb_draw_pass();
+                        Drawer kg = ui_spr(); kb_draw_pass(kg); ui_push(kg);
                     }
                 } else if (s_kbCur == 43) {              /* Cancel 回列表 */
                     state = W_LIST;
@@ -691,8 +754,10 @@ static void ui_wifi_loop(void)
             } else if (state == W_KB) {
                 int old = s_kbCur;
                 s_kbCur = (s_kbCur + dir + 45) % 45;
-                kb_draw_key(old, false);
-                kb_draw_key(s_kbCur, true);
+                Drawer kg = ui_spr();
+                kb_draw_key(kg, old, false);
+                kb_draw_key(kg, s_kbCur, true);
+                ui_push(kg);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -790,9 +855,9 @@ static void settings_draw(Drawer& g)
     for (int i = 0; i < 2; ++i) {
         int x = i ? 162 : 10;
         bool on = (s_setSel == i);
-        g.fillRoundRect(x, 198, 148, 22, 8, on ? th->surface2 : th->surface);
-        if (on) g.drawRoundRect(x, 198, 148, 22, 8, th->accent);
-        g.setTextColor(on ? th->accent : th->muted, on ? th->surface2 : th->surface);
+        g.fillRoundRect(x, 198, 148, 22, 8, on ? th->selBg : th->surface);
+        g.drawRoundRect(x, 198, 148, 22, 8, on ? th->accent : th->line);
+        g.setTextColor(on ? th->accent : th->muted, on ? th->selBg : th->surface);
         g.drawString(act[i], x + 74, 209);
     }
     g.setTextDatum(TL_DATUM);
@@ -894,7 +959,7 @@ static void ui_notes_loop(void)
                 int idx = top + i;
                 int y = 34 + i * 26;
                 bool on = (idx == sel);
-                uint16_t bg = on ? th->surface2 : th->surface;
+                uint16_t bg = on ? th->selBg : th->surface;
                 g.fillRoundRect(8, y, 304, 24, 8, bg);
                 if (on) {
                     g.drawRoundRect(8, y, 304, 24, 8, th->accent);

@@ -16,6 +16,7 @@
 #include "sd_app.h"
 #include "ui_app.h"
 #include "game_app.h"
+#include "theme.h"
 #include <SD.h>
 #include <WiFi.h>
 
@@ -563,6 +564,17 @@ static void serialCmdPoll(void)
                     g_gameMidReq = false;
                     ui_app_open(n);
                 } else Serial.println("[CMD] 用法 app 0..4");
+            } else if (cmd == "wopen") {
+                /* 调试：等价于设置页 CAM 单击（进入 WiFi 管理） */
+                g_wifiUiOpenReq = true;
+            } else if (cmd == "theme" || cmd.startsWith("theme ")) {
+                /* theme [d|l]：切换深/浅主题（不带参数=切换）。NVS 掉电保持 */
+                String a = cmd.substring(5); a.trim();
+                if      (a == "d" || a == "dark")  theme_set_dark(true);
+                else if (a == "l" || a == "light") theme_set_dark(false);
+                else                               theme_toggle();
+                Serial.printf("[CMD] 主题 = %s（切到 App 即整屏重绘）\n",
+                              g_themeDark ? "dark" : "light");
             } else if (cmd == "shot") {
                 /* shot：回传当前复用 Sprite（游戏/设置/备忘 整帧） */
                 lcd_app_dump_frame();

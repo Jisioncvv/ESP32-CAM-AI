@@ -842,9 +842,10 @@ static void gallery_show_info(int listIdx)
     tft.setTextDatum(TL_DATUM);
     tft.setTextFont(1);                    /* 关键：钉死 8px 字模 */
     tft.setTextSize(1);
-    tft.fillRect(0, 0, 320, 18, TFT_BLACK);
-    tft.setCursor(4, 5);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.fillRect(0, 0, 320, 18, g_th->osd);
+    tft.drawFastHLine(0, 17, 320, g_th->line);
+    tft.setCursor(6, 5);
+    tft.setTextColor(g_th->osdTx, g_th->osd);
     tft.print(s_names[listIdx] + "  " + (listIdx + 1) + "/" + s_count
               + "   2xCAM=del  MID=back");
 
@@ -1056,31 +1057,31 @@ void ui_camera_loop(void)
                     memcpy(s_previewBuf, fb->buf, (size_t)w * h * 2);
 
                 if (s_sprReady && s_spr) {
-                    s_spr->setTextDatum(TL_DATUM);
-                    s_spr->setTextSize(1);
-
-                    /* ---- Sprite 合成推屏：文字零闪烁 + 小字号贴边，遮挡最小
-                     * 左上角=帧率，右上角=WiFi 状态（绿=开 灰=关）
-                     * 纯净预览（DOWN 切换）：隐藏所有文字，只看画面 ---- */
+                    /* ---- OSD 跟随主题：底衬用 osd 色，文字用主题色 ----
+                     * [用户反馈] 浅色主题下画面还是"黄字+黑块"，和整个系统
+                     * 的浅色界面打架。改成主题色后深浅两套都协调，且底衬
+                     * 带描边，亮画面上也不会糊掉 */
+                    Drawer og = { s_spr, nullptr };   /* 只写 Sprite，不直绘 */
                     if (!cleanView) {
                         char info[16];
                         sprintf(info, "%dfps", (int)g_lcdFps);
-                        s_spr->setTextColor(TFT_YELLOW, TFT_BLACK);
-                        s_spr->drawString(info, 2, 2);
-
-                        if (g_wifiState == 1) {
-                            s_spr->setTextColor(TFT_GREEN, TFT_BLACK);
-                            s_spr->drawString("WiFi", 296, 2);
-                        } else if (g_wifiState == 0) {
-                            s_spr->setTextColor(TFT_DARKGREY, TFT_BLACK);
-                            s_spr->drawString("WiFi", 296, 2);
-                        }
+                        ui_osd_chip(og, 4, 4, info, g_th->accent);
+                        if (g_wifiState == 1)
+                            ui_osd_chip_right(og, 316, 4, "WiFi", g_th->ok);
+                        else if (g_wifiState == 0)
+                            ui_osd_chip_right(og, 316, 4, "WiFi", g_th->muted);
                     }
 
                     if (showSavingPopup) {
-                        s_spr->setTextSize(2);
-                        s_spr->setTextColor(TFT_YELLOW, TFT_BLACK);
-                        s_spr->drawString("SAVE...", 118, 108); /* 居中弹窗 */
+                        /* 居中弹窗：卡片底 + 强调色描边 + 强调色文字 */
+                        og.fillRoundRect(88, 96, 144, 34, 10, g_th->osd);
+                        og.drawRoundRect(88, 96, 144, 34, 10, g_th->accent);
+                        og.setTextDatum(MC_DATUM);
+                        og.setTextFont(2);
+                        og.setTextSize(1);
+                        og.setTextColor(g_th->accent, g_th->osd);
+                        og.drawString("SAVING", 160, 113);
+                        og.setTextDatum(TL_DATUM);
                     }
 
                     if (jpegFrame) s_spr->setSwapBytes(true);    /* TJpgDec 输出小端，推屏需换字节 */
@@ -1099,10 +1100,8 @@ void ui_camera_loop(void)
                     tft.pushImage(0, 0, 320, 240, (const uint16_t*)fb->buf);
                     char info[16];
                     sprintf(info, "%dfps", (int)g_lcdFps);
-                    tft.setTextDatum(TL_DATUM);
-                    tft.setTextSize(1);
-                    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-                    tft.drawString(info, 2, 2);
+                    Drawer og = { nullptr, &tft };
+                    ui_osd_chip(og, 4, 4, info, g_th->accent);
                 }
                 s_pushUs += micros() - t0;
             }
