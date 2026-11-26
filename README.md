@@ -1,5 +1,9 @@
 # ESP32-CAM-AI
 
+[![Build](https://github.com/Jisioncvv/ESP32-CAM-AI/actions/workflows/build.yml/badge.svg)](https://github.com/Jisioncvv/ESP32-CAM-AI/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-2ea44f.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-ESP32--S3-1f6feb.svg)](https://www.espressif.com/en/products/socs/esp32-s3)
+
 基于 **ESP32-S3 + OV5640** 的单板智能相机：FreeRTOS 双核调度、自研轻量 UI 框架（深/浅双主题）、
 本地相册、三款小游戏、WiFi 图传与局域网调参。整套交互只用板载 4 个按键，不依赖触摸屏。
 
@@ -77,6 +81,24 @@ pio device monitor -b 115200 # 串口日志
 ```
 
 `platformio.ini` 中已固定 TFT_eSPI 引脚与驱动配置，无需改库内 `User_Setup.h`。
+
+每次推送都有 CI 在云端编译（见 `Badge`），编译不通过即视为破坏主干；产物 `firmware.bin`
+可在 Actions 运行页的 Artifacts 里下载，不需要本地装工具链。
+
+## 下载固件
+
+打 tag 发布时（如 `git tag v1.0 -m "首个可用版本" && git push origin v1.0`），CI 会自动把
+`firmware.bin` 和 `SHA256SUMS.txt` 附加到 Release 页，免编译直接烧录：
+
+```bash
+pip install esptool
+# ESP32-S3 + Arduino 的应用分区偏移是 0x10000（不要写到 0x0，那是 bootloader）
+esptool.py --chip esp32s3 -p COM5 -b 460800 write_flash 0x10000 firmware.bin
+```
+
+前提是板子已经有过一次完整烧录（bootloader 与分区表在位）。全新芯片请直接用
+`pio run -t upload`，它会一并写入 bootloader、分区表与应用。
+
 
 ## 串口调试命令
 
