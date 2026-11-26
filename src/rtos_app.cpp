@@ -524,6 +524,9 @@ static void serialCmdPoll(void)
                 Serial.println("[CMD] 切换相册 App");
                 g_appMode = MODE_GALLERY;
                 g_appExitReq = false;
+            } else if (cmd == "gopen") {
+                /* 调试：等价于列表态 CAM 单击（打开选中照片） */
+                g_galleryOpenReq = true;
             } else if (cmd.startsWith("gdn ")) {
                 int n = cmd.substring(4).toInt();
                 for (int i = 0; i < n; ++i) {

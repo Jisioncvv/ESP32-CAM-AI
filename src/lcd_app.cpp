@@ -283,6 +283,11 @@ static void buildPhotoList(void)
     }
     root.close();
     s_listGen++;   /* 九宫格缩略图缓存失效标记 */
+    /* 列表变了（拍照新增/删除）→ 照片序号与文件名的对应关系可能整体错位，
+     * 全屏缓存与预解码缓存必须作废，否则会"点开 A 显示 B" */
+    s_cacheIdx = -1;
+    s_nextIdx  = -1;
+    s_prefetchReq = false;
 }
 
 /* 相册取图路径：有小图用小图（秒开），没有则回退大图全解码 */
@@ -469,6 +474,8 @@ static void grid_draw_topbar(void)
 {
     tft.fillRect(0, 0, 320, 20, TFT_WHITE);
     tft.drawFastHLine(0, 20, 320, 0xC618);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(1);        /* 钉死 8px 字模，防止继承上个 App 的大字号 */
     tft.setTextSize(1);
     tft.setTextColor(TFT_NAVY, TFT_WHITE);
     tft.setCursor(6, 6);
@@ -485,6 +492,8 @@ static void grid_draw_bottombar(void)
 {
     tft.fillRect(0, 232, 320, 8, TFT_WHITE);
     tft.drawFastHLine(0, 232, 320, 0xC618);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(1);
     tft.setTextSize(1);
     tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
     tft.setCursor(6, 233);
@@ -761,6 +770,55 @@ void lcd_app_gallery_debug_shot(void)
 }
 
 /* =====================================================================
+ * 全屏信息条（叠在照片顶部，1.2s 后自动隐藏）
+ * ---------------------------------------------------------------------
+ * [花屏残影根因] 旧实现用 fillRect(0,0,320,18) 清底 + 默认字模打印，然后
+ *   回贴 18px 高的一条缓存。但字模是"继承"来的：上一屏（九宫格顶栏/设置/
+ *   游戏）如果留的是 Font2，字符框 16px 高、起点 y=5，实际画到 y=21，
+ *   而恢复区只到 y=17 —— 底下 3~4 行（黑底 + 半个字的笔画）留在屏幕上，
+ *   看起来就是一长条花屏。字体状态随上一个 App 不同而不同，所以"有些照片
+ *   会恢复、有些不会"。
+ * 现在：① 显式复位 TextFont(1)/TextSize(1)，文字框严格落在 18px 内；
+ *      ② 隐藏时整帧回贴缓存（320x240）。走的是和翻页完全相同的推屏路径，
+ *         屏幕像素与缓存逐点一致，无论字体/叠加内容如何都不会留残迹；
+ *      ③ 非阻塞：只记时间戳，由主循环 tick 隐藏，翻页不再卡 1.2s。
+ * =================================================================== */
+static int      s_infoIdx   = -1;     /* 信息条当前对应的照片序号 */
+static uint32_t s_infoUntil = 0;      /* 到期隐藏的时刻 */
+static bool     s_infoShown = false;  /* 屏幕上是否有未隐藏的信息条 */
+
+static void gallery_show_info(int listIdx)
+{
+    /* 无缓存时叠加就没有"原图"可回贴，宁可不显示，避免留下永久污点 */
+    if (!s_cacheBuf || s_cacheIdx != listIdx) { s_infoShown = false; return; }
+
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextFont(1);                    /* 关键：钉死 8px 字模 */
+    tft.setTextSize(1);
+    tft.fillRect(0, 0, 320, 18, TFT_BLACK);
+    tft.setCursor(4, 5);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.print(s_names[listIdx] + "  " + (listIdx + 1) + "/" + s_count
+              + "   2xCAM=del  MID=back");
+
+    s_infoIdx   = listIdx;
+    s_infoUntil = millis() + 1200;
+    s_infoShown = true;
+}
+
+/* 主循环每次迭代调用：到期就把整帧从缓存回贴，恢复干净画面 */
+static void gallery_info_tick(void)
+{
+    if (!s_infoShown) return;
+    if ((int32_t)(millis() - s_infoUntil) < 0) return;
+    s_infoShown = false;
+    if (!s_cacheBuf || s_cacheIdx != s_infoIdx) return;   /* 照片已换/缓存失效 */
+    tft.setSwapBytes(true);
+    tft.pushImage(0, 0, 320, 240, s_cacheBuf);            /* 25ms 整帧复原 */
+    tft.setSwapBytes(false);
+}
+
+/* =====================================================================
  * 相册：全屏查看（三级加速）
  *   1. 当前图缓存命中   → 25ms 推屏（秒开）
  *   2. 相邻图预解码命中 → 25ms 推屏 + 缓冲互换（翻页秒开）
@@ -801,34 +859,25 @@ static void galleryFullscreen(int listIdx)
 
         tft.fillScreen(TFT_BLACK);
         tft.setCursor(5, 110);
+        tft.setTextFont(1);
         tft.setTextSize(2);
         tft.setTextColor(TFT_YELLOW, TFT_BLACK);
         tft.print("Loading...");
 
         s_caching  = (s_cacheBuf != nullptr);
         s_cacheIdx = listIdx;
+        /* 解码前把缓存清零：图片若不足 320x240（16:9 等），没被写到的区域
+         * 保持黑色，与屏幕 fillScreen 一致 → 缓存永远等于屏幕，回贴才安全 */
+        if (s_cacheBuf) memset(s_cacheBuf, 0, 320 * 240 * 2);
         TJpgDec.drawSdJpg(0, 0, path);
         s_caching = false;
 
         /* 解码回调已逐块上屏，画面完整，无需再次推屏 */
     }
 
-    /* [需求] 全屏画面保持干净：不加常驻信息条，仅进入瞬间显示 1.2s 提示，
-     * 超时后从照片缓存顶部回贴 18px 恢复干净画面（无缓存则不显示提示） */
-    uint16_t* hintSrc = (s_cacheBuf && s_cacheIdx == listIdx) ? s_cacheBuf
-                      : (hitBuf ? hitBuf : nullptr);
-    if (hintSrc) {
-        tft.fillRect(0, 0, 320, 18, TFT_BLACK);
-        tft.setCursor(4, 5);
-        tft.setTextSize(1);
-        tft.setTextColor(TFT_WHITE, TFT_BLACK);
-        tft.print(s_names[listIdx] + "  " + (listIdx + 1) + "/" + s_count
-                  + "   2xCAM=del  MID=back");
-        vTaskDelay(pdMS_TO_TICKS(1200));
-        tft.setSwapBytes(true);
-        tft.pushImage(0, 0, 320, 18, hintSrc);
-        tft.setSwapBytes(false);
-    }
+    /* [需求] 全屏画面保持干净：不加常驻信息条，进场瞬间叠加 1.2s 提示，
+     * 由相册主循环的非阻塞 tick 负责隐藏（不再 vTaskDelay，翻页不被卡住） */
+    gallery_show_info(listIdx);
 
     Serial.printf("[GALLERY] %s（%s）\n", s_names[listIdx].c_str(),
                   hitBuf ? "缓存命中" : "全图解码");
@@ -1048,9 +1097,12 @@ void ui_gallery_loop(void)
      * 强制失效页缓存，进相册必整页重绘 */
     s_gridSelDrawn = -1;
     s_gridTop     = -1;
+    s_infoShown   = false;                /* 进相册时清掉上次残留的信息条状态 */
     galleryGridPage();
 
     while (true) {
+        /* 全屏信息条到点自动隐藏（非阻塞，翻页期间也照常计时） */
+        gallery_info_tick();
         /* ---- 退出请求：列表态 MID 单击（keyTask 置位），回桌面 ---- */
         if (g_appExitReq) {
             g_appExitReq = false;
@@ -1064,6 +1116,7 @@ void ui_gallery_loop(void)
             g_galleryListRefreshReq = false;
             g_galleryView = 0;
             g_galleryOpenReq = false;
+            s_infoShown = false;   /* 整页重绘会覆盖信息条，先清状态 */
             s_gridSelDrawn = -1;   /* 全屏覆盖过屏幕：强制整页重绘 */
             s_gridTop     = -1;
             galleryGridPage();
@@ -1123,6 +1176,7 @@ void ui_gallery_loop(void)
                 if (s_cur >= s_count) s_cur = s_count - 1;
                 if (s_cur < 0) s_cur = 0;
                 g_galleryView = 0;             /* 回归九宫格列表 */
+                s_infoShown = false;
                 s_gridSelDrawn = -1;           /* 全屏覆盖过屏幕：强制整页重绘 */
                 s_gridTop     = -1;
                 galleryGridPage();
