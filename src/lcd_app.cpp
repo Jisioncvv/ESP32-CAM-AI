@@ -43,8 +43,12 @@ static uint32_t s_waitUs = 0;
 static TFT_eSprite* s_spr      = nullptr;
 static bool         s_sprReady = false;
 
-/* --------------------- 相册状态（文件夹式文本列表） --------------------- */
-#define MAX_PHOTOS   64
+/* --------------------- 相册状态（文件夹式文本列表） ---------------------
+ * [容量 bug 修复 2026-11-26] 原来是 64，且扫到第 64 个文件就 `continue`
+ * 不收了 —— FAT 目录通常按创建顺序遍历，于是"最早 64 张"占满名额，
+ * 之后拍的照片在相册里完全看不到（实测 75 张时新照片消失）。
+ * 现在放宽到 200，并且满员时挤掉编号最小的一张，保证列表永远是"最新" */
+#define MAX_PHOTOS   200
 
 static String s_names[MAX_PHOTOS];   /* 文件名（不含路径） */
 static bool   s_small[MAX_PHOTOS];   /* 对应小图 photo_Ns.jpg 是否存在 */
@@ -340,8 +344,7 @@ static void buildPhotoList(void)
             bool isSmall = name.startsWith("photo_") && name.endsWith("s.jpg") &&
                            !name.endsWith("ss.jpg");
             if (isSmall) continue;
-            if (name.startsWith("photo_") && name.endsWith(".jpg") &&
-                s_count < MAX_PHOTOS) {
+            if (name.startsWith("photo_") && name.endsWith(".jpg")) {
                 /* 按序号插入排序（photo_2 排在 photo_10 前面） */
                 int idx = name.substring(6, name.indexOf('.')).toInt();
                 int pos = s_count;
@@ -353,6 +356,20 @@ static void buildPhotoList(void)
                         s_small[pos] = s_small[pos - 1];
                         --pos;
                     } else break;
+                }
+                /* 满员：挤掉编号最小的（保证"新的优先于旧的"不在目录顺序上翻车） */
+                if (s_count >= MAX_PHOTOS) {
+                    if (pos == 0) { f.close(); continue; }   /* 比现有全部更旧 → 丢弃 */
+                    for (int i = 0; i < MAX_PHOTOS - 1; ++i) {
+                        s_names[i] = s_names[i + 1];
+                        s_small[i] = s_small[i + 1];
+                    }
+                    s_count = MAX_PHOTOS - 1;
+                    --pos;
+                }
+                for (int i = s_count; i > pos; --i) {
+                    s_names[i] = s_names[i - 1];
+                    s_small[i] = s_small[i - 1];
                 }
                 s_names[pos] = name;
                 /* 探测同名小图 photo_Ns.jpg（相册秒开的关键标记） */
@@ -455,22 +472,23 @@ static int       s_gridSelDrawn = -1;   /* 已画选中项（局部刷新用） 
  * 位图必须与缓存同步移位，否则会漏格或重复解码。 */
 static uint16_t  s_gridPendMask = 0;
 
-/* 区域平均降采样：320x240 暂存 → TH_WxTH_H（按实际解码后的 ow x oh 映射）
+/* 区域平均降采样：320x240 暂存 → dw x dh（按实际解码后的 ow x oh 映射）
  * [观感修复] 旧版最近邻只取单像素：暗光照片的高增益噪点被抽样成彩色麻点，
  * 在 102x68 缩略图上像"马赛克/花屏"。改为按源区域做 3x3~4x4 平均，
  * 噪点被平滑掉，缩略图观感干净且不再出现错行/黑带 */
-static void grid_decimate(uint16_t* dst, const uint16_t* src, int ow, int oh)
+static void img_decimate(uint16_t* dst, const uint16_t* src, int ow, int oh,
+                         int dw, int dh)
 {
     if (ow <= 0 || ow > 320) ow = 320;
     if (oh <= 0 || oh > 240) oh = 240;
-    for (int y = 0; y < TH_H; ++y) {
-        int sy0 = y * oh / TH_H;
-        int sy1 = (y + 1) * oh / TH_H;
+    for (int y = 0; y < dh; ++y) {
+        int sy0 = y * oh / dh;
+        int sy1 = (y + 1) * oh / dh;
         if (sy1 <= sy0) sy1 = sy0 + 1;
-        uint16_t* dr = dst + y * TH_W;
-        for (int x = 0; x < TH_W; ++x) {
-            int sx0 = x * ow / TH_W;
-            int sx1 = (x + 1) * ow / TH_W;
+        uint16_t* dr = dst + y * dw;
+        for (int x = 0; x < dw; ++x) {
+            int sx0 = x * ow / dw;
+            int sx1 = (x + 1) * ow / dw;
             if (sx1 <= sx0) sx1 = sx0 + 1;
             uint32_t rs = 0, gs = 0, bs = 0, cnt = 0;
             for (int sy = sy0; sy < sy1; ++sy) {
@@ -489,6 +507,12 @@ static void grid_decimate(uint16_t* dst, const uint16_t* src, int ow, int oh)
             dr[x] = (uint16_t)((r << 11) | (g << 5) | b);
         }
     }
+}
+
+/* 九宫格缩略图尺寸（固定 102x60 的格子，比例按格子走） */
+static void grid_decimate(uint16_t* dst, const uint16_t* src, int ow, int oh)
+{
+    img_decimate(dst, src, ow, oh, TH_W, TH_H);
 }
 
 /* JPEG 结尾校验：残图（缺 FF D9）解码会吐马赛克/蓝噪，必须提前拦截。
@@ -530,8 +554,9 @@ static void grid_placeholder(uint16_t* dst)
     for (int x = TH_W / 2 - 12; x < TH_W / 2 + 12; ++x) dst[y * TH_W + x] = th->line;
 }
 
-/* 解码一张图 → 102x68 缩略图写进 dst；返回是否成功 */
-static bool grid_decode_one(const String& path, uint16_t* dst)
+/* 解码一张图 → dw x dh 缩略图写进 dst；返回是否成功
+ * （dw/dh 可指定：九宫格用 102x60，相机拍后确认用 96x72 保持 4:3） */
+static bool img_decode_small(const String& path, uint16_t* dst, int dw, int dh)
 {
     memset(s_nextBuf, 0, 320 * 240 * 2);   /* 解码填不满的区域保持黑，杜绝残影 */
     if (!jpeg_tail_ok(path)) {
@@ -557,8 +582,14 @@ static bool grid_decode_one(const String& path, uint16_t* dst)
     /* [诊断] 解码路径/缩放/耗时：定位缩略图马赛克是文件问题还是解码读卡问题 */
     Serial.printf("[GAL] thumb %s sc=%d %s ok=%d %ums\n", path.c_str(), sc,
                   sw ? "size-ok" : "size-FAIL", (int)ok, millis() - t0);
-    if (ok) grid_decimate(dst, s_nextBuf, ow, oh);
+    if (ok) img_decimate(dst, s_nextBuf, ow, oh, dw, dh);
     return ok;
+}
+
+/* 九宫格单格（102x60） */
+static bool grid_decode_one(const String& path, uint16_t* dst)
+{
+    return img_decode_small(path, dst, TH_W, TH_H);
 }
 
 /* 解码窗口内第 k 格（k=0..8）的缩略图进缓存（失败画占位块，绝不留黑格） */
@@ -1225,6 +1256,11 @@ static void galleryPrefetchStep(void)
  *   [知识点2] 从帧队列取 RGB565 帧（cameraTask 生产，按需启动/停止）
  *   退出流程（g_appExitReq）：删采集任务 + 摄像头 deinit（省电）后返回桌面
  * =================================================================== */
+/* 拍后成片确认的小图尺寸：按照片 4:3 取 96x72（九宫格的 102x60 是格子比例，
+ * 直接用会把照片压扁，看构图会误判） */
+#define CAM_TH_W 96
+#define CAM_TH_H 72
+
 void ui_camera_loop(void)
 {
     camera_fb_t* fb = NULL;
@@ -1232,23 +1268,44 @@ void ui_camera_loop(void)
     bool cleanView = false;  /* DOWN：纯净预览（隐藏文字） */
     bool rot180    = false;  /* TOP 双击：画面旋转 180° */
 
+    /* ---- 本轮新增：构图线 / 定时倒数 / 档位提示 / 拍后成片确认 ---- */
+    bool     gridOn     = false;      /* MID 双击：三分构图线 */
+    int      cdLeft     = -1;         /* 定时倒数剩余秒数（-1=未倒数） */
+    uint32_t cdNext     = 0;
+    int      prevTimer  = camera_app_timer_get();
+    int      prevBright = camera_app_brightness_get();
+    uint32_t toastUntil = 0;          /* 档位变更提示的显示截止时刻 */
+    char     toastTxt[20] = "";
+    int      seenShot   = camera_app_last_shot_seq();
+    uint32_t thumbUntil = 0;          /* 成片缩略图显示截止时刻 */
+    int      thumbPendSeq  = -1;      /* 待解码成片序号（-1=无） */
+    uint32_t thumbRetryAt  = 0;       /* 下次尝试解码时刻（等后台写卡） */
+    uint32_t thumbDeadline = 0;       /* 重试截止 */
+    uint16_t* thumbBuf  = (uint16_t*)heap_caps_malloc(CAM_TH_W * CAM_TH_H * 2,
+                                                      MALLOC_CAP_SPIRAM);
+
     while (true) {
         /* ---- 退出请求：关闭摄像头后回桌面（MID 单击，keyTask 置位） ---- */
         if (g_appExitReq) {
             g_appExitReq = false;
+            g_camCountdownReq = false;        /* 取消未完成的定时 */
+            g_camShotGo       = false;
             rtos_stop_camera_task();
             esp_camera_deinit();
             g_cameraReady = false;
             digitalWrite(PIN_LCD_BL, HIGH);   /* 恢复背光（避免黑屏状态下退出） */
+            if (thumbBuf) { free(thumbBuf); thumbBuf = nullptr; }
             Serial.println("[UI] 退出相机 App：采集任务已删 + 摄像头已断电（省电）");
+            return;
             return;
         }
 
         /* ---- 相机 App 按键功能 ----
          * TOP  单击：背光开/关   | TOP  双击：画面旋转 180° | TOP 长按：WiFi 开关
-         * DOWN 单击：纯净预览    | DOWN 双击：黑白/彩色预览
-         * MID  单击：退出 App    | MID  长按：系统重启
-         * CAM  单击：拍照        | CAM  双击/长按：闪光灯拍照 */
+         * DOWN 单击：纯净预览    | DOWN 双击：黑白/彩色     | DOWN 长按：曝光补偿 +1 档
+         * MID  单击：退出 App    | MID  双击：三分构图线     | MID 长按：系统重启
+         * CAM  单击：拍照（定时开着则先倒数）
+         * CAM  双击：闪光拍照    | CAM  长按：定时档位 OFF/3s/5s/10s */
         if (g_dispReqRotate) {
             g_dispReqRotate = false;
             rot180 = !rot180;
@@ -1265,6 +1322,79 @@ void ui_camera_loop(void)
             g_btDownstate = 0;
             cleanView = !cleanView;
             Serial.printf("[LCD] 纯净预览 %s\n", cleanView ? "开" : "关");
+        }
+
+        /* ---- MID 双击：三分构图线开关（keyTask 只置请求） ---- */
+        if (g_dispReqGrid) {
+            g_dispReqGrid = false;
+            gridOn = !gridOn;
+            snprintf(toastTxt, sizeof(toastTxt), gridOn ? "Grid ON" : "Grid OFF");
+            toastUntil = millis() + 1200;
+            Serial.printf("[LCD] 构图三分线 %s\n", gridOn ? "开" : "关");
+        }
+
+        /* ---- DOWN 长按改的数字亮度：值变了才写传感器 ----
+         * 不在 keyTask 里直接写：keyTask 是核 1 高优先任务，而传感器归
+         * displayTask（本循环）管，跨任务同时写 SCCB 有风险 */
+        int briNow = camera_app_brightness_get();
+        if (briNow != prevBright) {
+            prevBright = briNow;
+            camera_app_apply_soft_config();
+            snprintf(toastTxt, sizeof(toastTxt), "Bright %+d", briNow);
+            toastUntil = millis() + 1200;
+        }
+
+        /* ---- CAM 长按改的定时档位：只提示，不倒计时 ---- */
+        int tmrNow = camera_app_timer_get();
+        if (tmrNow != prevTimer) {
+            prevTimer = tmrNow;
+            snprintf(toastTxt, sizeof(toastTxt), "Timer %s", camera_app_timer_text(tmrNow));
+            toastUntil = millis() + 1500;
+        }
+
+        /* ---- 定时自拍倒数：按秒推进，数到 0 交给 keyTask 真拍照 ---- */
+        if (g_camCountdownReq) {
+            g_camCountdownReq = false;
+            int sec = camera_app_timer_seconds(camera_app_timer_get());
+            if (cdLeft < 0 && sec > 0) {
+                cdLeft = sec;
+                cdNext = millis() + 1000;
+                Serial.printf("[CAM] 定时倒数开始 %ds\n", sec);
+            }
+        }
+        if (cdLeft >= 0 && (int32_t)(millis() - cdNext) >= 0) {
+            cdNext += 1000;
+            if (--cdLeft <= 0) {
+                cdLeft = -1;
+                Serial.println("[CAM] 倒数结束 → 拍照");
+                g_camShotGo = true;
+            }
+        }
+
+        /* ---- 拍后成片确认：解码刚保存的小图，右下角显示 2.5s ----
+         * 小图由后台任务异步写卡，可能还没落盘：解码失败就隔 250ms 重试，
+         * 最多 3s（不阻塞预览，也不再"拍完什么反馈都没有"） */
+        int shotSeq = camera_app_last_shot_seq();
+        if (shotSeq != seenShot) {
+            seenShot     = shotSeq;
+            thumbPendSeq = shotSeq;
+            thumbRetryAt = millis();
+            thumbDeadline = millis() + 3000;
+        }
+        if (thumbPendSeq >= 0 && thumbBuf && (int32_t)(millis() - thumbRetryAt) >= 0) {
+            String small = camera_app_last_shot_path();
+            small.replace(".jpg", "s.jpg");
+            if (img_decode_small(small, thumbBuf, CAM_TH_W, CAM_TH_H)) {
+                thumbUntil   = millis() + 2500;
+                thumbPendSeq = -1;
+            } else if ((int32_t)(millis() - thumbDeadline) >= 0) {
+                for (int i = 0; i < CAM_TH_W * CAM_TH_H; ++i) thumbBuf[i] = g_th->surface;
+                thumbUntil   = millis() + 1500;
+                thumbPendSeq = -1;
+                Serial.println("[CAM] 成片确认：小图解码失败，显示占位块");
+            } else {
+                thumbRetryAt = millis() + 250;   /* 后台还没写完，稍后重试 */
+            }
         }
 
         uint32_t tW0 = micros();
@@ -1338,6 +1468,64 @@ void ui_camera_loop(void)
                         og.setTextColor(g_th->accent, g_th->osd);
                         og.drawString("SAVING", 160, 113);
                         og.setTextDatum(TL_DATUM);
+                    }
+
+                    /* ---- 三分构图线：1px 虚线（2 亮 2 空），不挡画面 ---- */
+                    if (gridOn) {
+                        for (int i = 1; i <= 2; ++i) {
+                            int gx = i * 320 / 3;
+                            int gy = i * 240 / 3;
+                            for (int y = 0; y < 240; y += 4) og.fillRect(gx, y, 1, 2, g_th->text);
+                            for (int x = 0; x < 320; x += 4) og.fillRect(x, gy, 2, 1, g_th->text);
+                        }
+                    }
+
+                    /* ---- 定时倒数：居中大数字 + Timer 标签 ----
+                     * [坑] 不能用 setTextFont(4)：platformio.ini 只开了
+                     * LOAD_GLCD + LOAD_FONT2，字体 4 没编进去 → 画不出任何东西
+                     * （第一版就是这样：只有框和 Timer，数字全空）。
+                     * 用 Font2 放大 3 倍 = 48px 高，远看更醒目，且不占 Flash */
+                    if (cdLeft > 0) {
+                        og.fillRoundRect(120, 74, 80, 80, 14, g_th->osd);
+                        og.drawRoundRect(120, 74, 80, 80, 14, g_th->accent);
+                        char cb[6];
+                        snprintf(cb, sizeof(cb), "%d", cdLeft);
+                        String cbs(cb);
+                        og.setTextDatum(TL_DATUM);
+                        og.setTextFont(2);
+                        og.setTextSize(3);
+                        og.setTextColor(g_th->accent, g_th->osd);
+                        /* 手动居中：TFT_eSPI 的 datum 偏移按 8px 字高算，
+                         * Font2 放大后对不准，这里自己算宽度更可靠。
+                         * 数字 48px 高，画在 84..132；Timer 标签 138..146 */
+                        og.drawString(cbs, 160 - og.textWidth(cbs) / 2, 84);
+                        og.setTextFont(1);
+                        og.setTextSize(1);
+                        og.setTextColor(g_th->muted, g_th->osd);
+                        og.drawString("Timer", 160 - og.textWidth("Timer") / 2, 138);
+                    }
+
+                    /* ---- 档位变更提示（EV / Timer / Grid）---- */
+                    if (toastTxt[0] && (int32_t)(millis() - toastUntil) < 0) {
+                        int tw = ui_osd_width(toastTxt);
+                        og.fillRoundRect(160 - tw / 2, 24, tw, UI_OSD_H, 7, g_th->osd);
+                        og.drawRoundRect(160 - tw / 2, 24, tw, UI_OSD_H, 7, g_th->accent);
+                        og.setTextDatum(TL_DATUM);
+                        og.setTextFont(1);
+                        og.setTextSize(1);
+                        og.setTextColor(g_th->accent, g_th->osd);
+                        og.drawString(toastTxt, 160 - tw / 2 + 5, 24 + 3);
+                    }
+
+                    /* ---- 成片确认：右下角缩略图（4:3 保持比例） + 强调色边框 ---- */
+                    if (thumbBuf && (int32_t)(millis() - thumbUntil) < 0) {
+                        int tx = 320 - CAM_TH_W - 6;
+                        int ty = 240 - CAM_TH_H - 6;
+                        og.fillRect(tx - 3, ty - 3, CAM_TH_W + 6, CAM_TH_H + 6, g_th->osd);
+                        og.drawRect(tx - 3, ty - 3, CAM_TH_W + 6, CAM_TH_H + 6, g_th->accent);
+                        s_spr->setSwapBytes(true);   /* TJpgDec 小端 → Sprite 大端存储 */
+                        s_spr->pushImage(tx, ty, CAM_TH_W, CAM_TH_H, thumbBuf);
+                        s_spr->setSwapBytes(false);
                     }
 
                     if (jpegFrame) s_spr->setSwapBytes(true);    /* TJpgDec 输出小端，推屏需换字节 */

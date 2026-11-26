@@ -40,6 +40,10 @@ volatile bool g_galleryOpenReq  = false;
 volatile bool g_galleryDeleteReq = false;   /* CAM 双击：全屏态删除当前照片 */
 volatile bool g_galleryListRefreshReq = false;  /* 全屏→列表 刷新请求 */
 volatile bool g_dispReqRotate    = false;   /* TOP 双击：预览旋转 180° */
+volatile bool g_dispReqGrid      = false;   /* MID 双击：构图三分线开关 */
+/* 定时自拍：keyTask 只发请求，倒计时画面由相机循环画（那里才有预览帧） */
+volatile bool g_camCountdownReq  = false;   /* CAM 单击且定时器非关 */
+volatile bool g_camShotGo        = false;   /* 倒计时结束 → keyTask 执行拍照 */
 volatile int8_t g_wifiState      = -1;      /* WiFi 状态：-1=初始 0=关 1=开（屏幕指示用） */
 
 /* ===================================================================== */
@@ -174,8 +178,13 @@ static void camSingleClick() {
         case MODE_DESKTOP:                 /* 桌面：打开选中 App */
             ui_app_open(g_appSel);
             break;
-        case MODE_CAMERA:                  /* 相机 App：官方单击拍照 */
-            camPhotoSaveSafe();
+        case MODE_CAMERA:                  /* 相机 App：单击拍照 */
+            /* 定时器开着 → 交给相机循环倒数，数完由 g_camShotGo 回来触发；
+             * 关着 → 直接拍（保持按下即拍的即时感） */
+            if (camera_app_timer_seconds(camera_app_timer_get()) > 0)
+                g_camCountdownReq = true;
+            else
+                camPhotoSaveSafe();
             break;
         case MODE_GALLERY:                 /* 相册列表态：打开选中照片 */
             if (g_galleryView == 0) g_galleryOpenReq = true;
@@ -213,11 +222,12 @@ static void camLongPress() {
         if (g_gameCamHold < 4) g_gameCamHold++;
         return;
     }
-    /* 闪光灯拍照仅限相机 App 实时预览态 */
+    /* 相机：CAM 长按 = 定时自拍档位循环（OFF→3s→5s→10s）
+     * [为什么改这里] 原来长按=闪光拍照，与 CAM 双击完全重复；
+     * 让出来换定时器，闪光拍照仍在双击，功能无损 */
     if (g_appMode == MODE_CAMERA) {
-        digitalWrite(PIN_FLASH_LED, LOW);
-        camPhotoSaveSafe();
-        digitalWrite(PIN_FLASH_LED, HIGH);
+        camera_app_timer_set((camera_app_timer_get() + 1) % CAM_TIMER_COUNT);
+        return;
     }
 }
 static void topSingleClick() {
@@ -285,9 +295,16 @@ static void downLongPress()
         if (g_gameDown < 8) g_gameDown++;
         return;
     }
+    /* 相机：DOWN 长按 = 数字亮度 +1 档（+2 再按回到 -2，循环）
+     * 实测 JPEG 成片比预览暗约 1EV，这个偏移是真正有效的补偿手段 */
+    if (g_appMode == MODE_CAMERA) {
+        camera_app_brightness_adjust(1);
+        return;
+    }
 }
 static void midLongPress()    { ESP.restart(); }            /* 系统重启（卡死自救） */
 static void downDoubleClick() { if (g_appMode == MODE_CAMERA) camera_app_set_gray(-1); }  /* 黑白/彩色切换 */
+static void midDoubleClick()  { if (g_appMode == MODE_CAMERA) g_dispReqGrid = true; }     /* 三分构图线 */
 
 /* 官方 handleKey 状态机（增加"可连发长按"与"相册免双击等待"两条通路）
  *   连发键（相册上下）：超过长按阈值立即执行第一次，按住期间每
@@ -494,18 +511,20 @@ static void serialCmdPoll(void)
             } else if (cmd.startsWith("ae ") || cmd.startsWith("wb ") || cmd.startsWith("sat ")) {
                 /* 实时调参（免重烧验证）：ae -2..2 曝光目标 / wb 0..4 白平衡
                  * 模式(0自动 1晴天 2阴天 3水 4白炽灯) / sat -2..2 饱和度 */
-                if (!g_cameraReady) {
-                    Serial.println("[CMD] 摄像头未启动（先进相机 App）");
+                String w = cmd.substring(0, 2);
+                int v = cmd.substring(3).toInt();
+                if (v < -2) v = -2;
+                if (v > (w == "wb" ? 4 : 2)) v = (w == "wb" ? 4 : 2);
+                if (w == "ae") {
+                    Serial.println("[CMD] ae_level 实测对 JPEG 成片无效，请用 bri -2..2");
+                } else if (w == "wb") {
+                    camera_app_photo_wb_set(v);
+                    Serial.printf("[CMD] wb_mode=%d（已存 NVS）\n", v);
+                } else if (!g_cameraReady) {
+                    Serial.println("[CMD] 摄像头未启动（sat 需要先进相机 App）");
                 } else {
                     sensor_t* s = esp_camera_sensor_get();
-                    int v = cmd.substring(3).toInt();
-                    String w = cmd.substring(0, 2);
-                    if (v < -2) v = -2;
-                    if (v > (w == "wb" ? 4 : 2)) v = (w == "wb" ? 4 : 2);
-                    if (w == "ae") { s->set_ae_level(s, v); Serial.printf("[CMD] ae_level=%d\n", v); }
-                    /* wb 走档位接口：立即生效 + 写 NVS（拍照重新 init 后不会被覆盖） */
-                    if (w == "wb") { camera_app_photo_wb_set(v); Serial.printf("[CMD] wb_mode=%d（已存 NVS）\n", v); }
-                    if (w == "sat") { s->set_saturation(s, v); Serial.printf("[CMD] saturation=%d\n", v); }
+                    if (s) { s->set_saturation(s, v); Serial.printf("[CMD] saturation=%d\n", v); }
                 }
             } else if (cmd == "snap") {
                 /* 远程拍照（A/B 对比调参用）：存卡后用 getphoto/Web 回读 */
@@ -522,6 +541,13 @@ static void serialCmdPoll(void)
             } else if (cmd == "wifion") {
                 web_app_wifi_user_toggle();
                 Serial.println("[CMD] WiFi 开启请求（后台自动连）");
+            } else if (cmd.startsWith("psz ")) {
+                /* psz N：按"档位索引"切分辨率（0=HD 1=XGA 2=SXGA），
+                 * 走 camera_app_photo_size_set → 同步写 NVS，与设置页等价 */
+                int n = cmd.substring(4).toInt();
+                camera_app_photo_size_set(n);
+                Serial.printf("[CMD] 分辨率档位 → %s\n",
+                              camera_app_photo_size_text(camera_app_photo_size_get()));
             } else if (cmd.startsWith("psize")) {
                 /* psize N（sensor.h framesize_t 枚举）：9=SVGA 10=XGA 11=HD
                  * 12=SXGA 13=UXGA 19=QSXGA（设备拍照分辨率实测用） */
@@ -530,11 +556,53 @@ static void serialCmdPoll(void)
                     g_photoFs = n;
                     Serial.printf("[CMD] 拍照分辨率 → framesize=%d\n", n);
                 } else Serial.println("[CMD] 用法 psize 0..19");
+            } else if (cmd.startsWith("tmr")) {
+                /* tmr [0..3|off/3s/5s/10s]：定时自拍档位（调试/自动截图用） */
+                String a = cmd.substring(3); a.trim();
+                int n = -1;
+                if (a == "off") n = 0;
+                else if (a == "3s") n = 1;
+                else if (a == "5s") n = 2;
+                else if (a == "10s") n = 3;
+                else if (a.length()) n = a.toInt();
+                if (n < 0) {
+                    Serial.printf("[CMD] 定时自拍 = %s（0=OFF 1=3s 2=5s 3=10s）\n",
+                                  camera_app_timer_text(camera_app_timer_get()));
+                } else {
+                    camera_app_timer_set(n);
+                    Serial.printf("[CMD] 定时自拍 → %s\n", camera_app_timer_text(camera_app_timer_get()));
+                }
+            } else if (cmd.startsWith("bri ")) {
+                /* bri -2..2：数字亮度偏移（补偿 JPEG 成片偏暗，实测用） */
+                camera_app_brightness_set(cmd.substring(4).toInt());
+            } else if (cmd.startsWith("setl ")) {
+                /* setl N：拍照前 AE/AWB 收敛预算（ms），实测成片亮度用 */
+                camera_app_settle_ms_set((uint32_t)cmd.substring(5).toInt());
+            } else if (cmd.startsWith("ev ")) {
+                /* ev N：旧名保留，等价 bri N（实测 ae_level 对 JPEG 无效） */
+                camera_app_brightness_set(cmd.substring(3).toInt());
+                Serial.printf("[CMD] 数字亮度 = %+d\n", camera_app_brightness_get());
+            } else if (cmd == "grid") {
+                /* grid：等价于 MID 双击（三分构图线开关） */
+                g_dispReqGrid = true;
+                Serial.println("[CMD] 构图线切换请求");
+            } else if (cmd == "cd") {
+                /* cd：等价于相机内 CAM 单击（定时开着则触发倒数） */
+                if (g_appMode != MODE_CAMERA) Serial.println("[CMD] 需在相机 App");
+                else if (camera_app_timer_seconds(camera_app_timer_get()) > 0) {
+                    g_camCountdownReq = true;
+                    Serial.println("[CMD] 触发定时倒数");
+                } else {
+                    camPhotoSaveSafe();
+                }
             } else if (cmd == "appcam") {
-                /* 调试：切到相机 App（预览跑起来后可用 snap 测真实按键拍照耗时） */
+                /* 调试：切到相机 App。必须走 ui_app_open(0)：那里才会
+                 * camera_app_init + 启动采集任务；只改 g_appMode 会黑屏 */
                 Serial.println("[CMD] 切换相机 App");
-                g_appMode = MODE_CAMERA;
+                g_appExitReq = true;
+                vTaskDelay(pdMS_TO_TICKS(300));
                 g_appExitReq = false;
+                ui_app_open(0);
             } else if (cmd.startsWith("del ")) {
                 /* del N：删除 photo_N.jpg + photo_Ns.jpg（清理测试照片用） */
                 int n = cmd.substring(4).toInt();
@@ -643,8 +711,14 @@ void keyTask(void* arg)
     while (true) {
         handleKey(keys[0], "拍照键", camSingleClick, camDoubleClick, camLongPress);
         handleKey(keys[1], "上键",   topSingleClick, topDoubleClick, topLongPress);
-        handleKey(keys[2], "中键",   midSingleClick, nullptr, midLongPress);
+        handleKey(keys[2], "中键",   midSingleClick, midDoubleClick, midLongPress);
         handleKey(keys[3], "下键",   downSingleClick, downDoubleClick, downLongPress);
+        /* 定时倒数结束 → 在这里拍：拍照会阻塞约 3.6s，
+         * 放在 keyTask 才能让相机循环继续画 SAVING 弹窗（与旧路径一致） */
+        if (g_camShotGo) {
+            g_camShotGo = false;
+            if (g_appMode == MODE_CAMERA) camPhotoSaveSafe();
+        }
         serialCmdPoll();             /* USB 串口调试命令 */
 
         vTaskDelay(pdMS_TO_TICKS(10));   /* 官方 10ms 轮询 */

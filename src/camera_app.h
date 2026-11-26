@@ -47,11 +47,39 @@ int  camera_app_photo_wb_get(void);
 void camera_app_photo_wb_set(int idx);
 const char* camera_app_photo_wb_text(int idx);
 
+/* 定时自拍：0=关 1=3s 2=5s 3=10s（相机 App 内 CAM 长按循环切换，NVS 保持）
+ * [为什么需要] 没有定时就只能有人按快门，合影/构图完全拍不了 */
+#define CAM_TIMER_COUNT 4
+int  camera_app_timer_get(void);                 /* 0..CAM_TIMER_COUNT-1 */
+void camera_app_timer_set(int idx);
+const char* camera_app_timer_text(int idx);      /* "OFF" / "3s" / "5s" / "10s" */
+int  camera_app_timer_seconds(int idx);          /* 0 / 3 / 5 / 10 */
+
+/* 数字亮度偏移：-2..+2（相机 App 内 DOWN 长按循环，NVS 保持，0 为默认）
+ * [实测结论 2026-11-26] 同一场景 RGB565 预览 Y≈102，JPEG 成片 Y≈48
+ * （QVGA/XGA 都暗，说明是 JPEG(YUV) 通路与 RGB 通路的曲线差异，不是曝光不足）。
+ * set_ae_level 调 ±2 对成片几乎无影响；set_brightness 每档约 +0.5EV
+ * （Y: 0→48 / +1→64 / +2→80），是真正有效的补偿手段 */
+#define CAM_BRI_MIN (-2)
+#define CAM_BRI_MAX ( 2)
+int  camera_app_brightness_get(void);
+void camera_app_brightness_set(int v);           /* 越界截断 + 写 NVS */
+int  camera_app_brightness_adjust(int delta);    /* ±2 循环，返回新值 */
+
+/* 拍照完成通知：序号每保存成功一次 +1（相机循环比对后弹成片缩略确认）
+ * path 为刚保存的大图路径，小图 +s 后缀 */
+int  camera_app_last_shot_seq(void);
+const String& camera_app_last_shot_path(void);
+
 /* 启动时从 NVS 载入档位（main 里调用一次） */
 void camera_app_load_prefs(void);
 
 /* AWB/AEC 收敛：等 300ms + 丢弃 6 帧过渡帧（重初始化后调用，防预览偏红/偏黄） */
 void camera_app_settle_awb(uint8_t frames = 6);
+
+/* 拍照前收敛预算（ms）：实测成片比预览暗 1EV 时用来定位 AE 是否爬到位 */
+void     camera_app_settle_ms_set(uint32_t ms);
+uint32_t camera_app_settle_ms_get(void);
 
 /* 官方拍照存卡流程（可在按键任务/Web 任务上下文直接调用）：
  *   显示 SAVE 提示 → 删除采集任务 → deinit → JPEG QSXGA 重初始化

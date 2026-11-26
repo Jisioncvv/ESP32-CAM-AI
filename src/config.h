@@ -97,6 +97,11 @@ extern volatile bool g_galleryOpenReq;  /* CAM 单击请求打开选中照片（
 extern volatile bool g_galleryDeleteReq; /* CAM 双击请求删除当前照片（全屏态） */
 extern volatile bool g_galleryListRefreshReq; /* 全屏→列表 刷新请求（keyTask MID 置位） */
 extern volatile bool g_dispReqRotate;   /* TOP 双击请求预览画面旋转 180°（仅相机 App） */
+extern volatile bool g_dispReqGrid;     /* MID 双击请求三分构图线开关（仅相机 App） */
+/* 定时自拍：keyTask 只发倒数请求，倒数画面由相机循环画；
+ * 数到 0 后由相机循环把 g_camShotGo 置位，keyTask 接着执行阻塞拍照 */
+extern volatile bool g_camCountdownReq;
+extern volatile bool g_camShotGo;
 extern volatile int8_t g_wifiState;     /* WiFi 状态：-1=初始 0=关 1=开（屏幕指示用） */
 
 /* --------------------- 任务参数 --------------------- */

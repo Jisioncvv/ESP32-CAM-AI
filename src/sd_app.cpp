@@ -179,8 +179,12 @@ int sd_app_clear_all(void)
  * =================================================================== */
 bool sd_app_dump_photo(int idx, bool small)
 {
-    /* 1. 收集编号（大图 photo_N.jpg / 小图 photo_Ns.jpg），按编号降序，idx=1 最新 */
-    int nums[64];
+    /* 1. 收集编号（大图 photo_N.jpg / 小图 photo_Ns.jpg），按编号降序，idx=1 最新
+     * [容量 bug 修复] 原来 nums[64] 且到 64 就停收 —— 目录按创建顺序遍历，
+     * 于是"最早 64 张"占满名额，之后拍的照片 getphoto 永远取不到（相册同理）。
+     * 现在容量 200，满员时挤掉编号最小的，保证取的永远是"最新的几张" */
+    #define SD_DUMP_MAX 200
+    int nums[SD_DUMP_MAX];
     int n = 0;
     File root = SD.open("/");
     if (root) {
@@ -200,7 +204,22 @@ bool sd_app_dump_photo(int idx, bool small)
                     bool digits = num.length() > 0;
                     for (unsigned int i = 0; i < num.length() && digits; ++i)
                         if (!isDigit(num.charAt(i))) digits = false;
-                    if (digits && n < 64) nums[n++] = num.toInt();
+                    if (digits) {
+                        int v = num.toInt();
+                        int pos = n;
+                        while (pos > 0 && nums[pos - 1] > v) --pos;
+                        if (n >= SD_DUMP_MAX) {
+                            if (pos == 0) {                    /* 更旧 → 丢 */
+                                f.close(); f = root.openNextFile(); continue;
+                            }
+                            for (int i = 0; i < SD_DUMP_MAX - 1; ++i) nums[i] = nums[i + 1];
+                            n = SD_DUMP_MAX - 1;
+                            --pos;
+                        }
+                        for (int i = n; i > pos; --i) nums[i] = nums[i - 1];
+                        nums[pos] = v;
+                        ++n;
+                    }
                 }
             }
             f.close();

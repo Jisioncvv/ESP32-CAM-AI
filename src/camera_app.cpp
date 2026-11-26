@@ -60,9 +60,29 @@ static const char* kWbText[CAM_WB_COUNT] = { "Auto", "Sunny", "Cloudy", "Office"
 
 static const char* kLookText[CAM_LOOK_COUNT] = { "Natural", "Vivid" };
 
+/* 定时自拍档位（秒）：0=关 */
+static const char* kTimerText[CAM_TIMER_COUNT] = { "OFF", "3s", "5s", "10s" };
+static const int   kTimerSec[CAM_TIMER_COUNT]  = { 0, 3, 5, 10 };
+
 static int s_pszIdx  = 1;   /* 默认 XGA：4:3 全画幅 + 拍照约 3.6s */
 static int s_lookIdx = 0;   /* 默认 Natural：贴近肉眼 */
 static int s_wbIdx   = 0;   /* 默认 Auto */
+static int s_tmrIdx  = 0;   /* 默认不定时 */
+/* 拍照前 AE/AWB 收敛预算（ms，串口 setl N 可调） */
+static uint32_t s_settleMs = 900;
+/* 数字亮度偏移（-2..+2，串口 bri N 实测用）
+ * [为什么单独要它] 实测同一场景：RGB565 预览 Y≈102，JPEG 成片 Y≈47~50
+ * （QVGA/XGA 都暗），set_ae_level 调 ±2 几乎无效果 —— 说明不是曝光不足，
+ * 而是 OV5640 的 JPEG(YUV) 通路与 RGB 通路 gamma/亮度曲线不同。
+ * 用传感器数字亮度偏移把成片拉回"预览看起来的样子" */
+static int s_bri = 0;
+
+/* 拍照完成通知：相机循环靠序号变化弹出"刚拍的成片"缩略图（拍完即时确认） */
+static volatile int s_lastShotSeq = 0;
+static String       s_lastShotPath;
+
+int camera_app_last_shot_seq(void)        { return s_lastShotSeq; }
+const String& camera_app_last_shot_path(void) { return s_lastShotPath; }
 
 void camera_app_load_prefs(void)
 {
@@ -74,14 +94,68 @@ void camera_app_load_prefs(void)
         s_pszIdx  = p.getUChar("psz",  1);
         s_lookIdx = p.getUChar("look", 0);
         s_wbIdx   = p.getUChar("wb",   0);
+        s_tmrIdx  = p.getUChar("tmr",  0);
+        s_bri     = p.getChar ("bri",  0);
         p.end();
     }
     if (s_pszIdx  < 0 || s_pszIdx  >= CAM_PSZ_COUNT)  s_pszIdx  = 1;
     if (s_lookIdx < 0 || s_lookIdx >= CAM_LOOK_COUNT) s_lookIdx = 0;
     if (s_wbIdx   < 0 || s_wbIdx   >= CAM_WB_COUNT)   s_wbIdx   = 0;
+    if (s_tmrIdx  < 0 || s_tmrIdx  >= CAM_TIMER_COUNT) s_tmrIdx = 0;
+    if (s_bri < CAM_BRI_MIN) s_bri = CAM_BRI_MIN;
+    if (s_bri > CAM_BRI_MAX) s_bri = CAM_BRI_MAX;
     g_photoFs = (int)kPhotoFs[s_pszIdx];
-    Serial.printf("[CAM] 拍照档位：%s / %s / WB=%s\n",
-                  kPhotoFsText[s_pszIdx], kLookText[s_lookIdx], kWbText[s_wbIdx]);
+    Serial.printf("[CAM] 拍照档位：%s / %s / WB=%s / Timer=%s / Bright=%+d\n",
+                  kPhotoFsText[s_pszIdx], kLookText[s_lookIdx], kWbText[s_wbIdx],
+                  kTimerText[s_tmrIdx], s_bri);
+}
+
+/* ---------------- 定时自拍 ---------------- */
+int camera_app_timer_get(void) { return s_tmrIdx; }
+
+void camera_app_timer_set(int idx)
+{
+    if (idx < 0 || idx >= CAM_TIMER_COUNT) return;
+    s_tmrIdx = idx;
+    Preferences p;
+    if (p.begin("cam", false)) { p.putUChar("tmr", (uint8_t)idx); p.end(); }
+    Serial.printf("[CAM] 定时自拍 → %s\n", kTimerText[idx]);
+}
+
+const char* camera_app_timer_text(int idx)
+{
+    return (idx >= 0 && idx < CAM_TIMER_COUNT) ? kTimerText[idx] : "-";
+}
+
+int camera_app_timer_seconds(int idx)
+{
+    return (idx >= 0 && idx < CAM_TIMER_COUNT) ? kTimerSec[idx] : 0;
+}
+
+/* ---------------- 数字亮度偏移（补偿 JPEG 成片偏暗） ---------------- */
+int camera_app_brightness_get(void) { return s_bri; }
+
+void camera_app_brightness_set(int v)
+{
+    if (v < CAM_BRI_MIN) v = CAM_BRI_MIN;
+    if (v > CAM_BRI_MAX) v = CAM_BRI_MAX;
+    s_bri = v;
+    Preferences p;
+    if (p.begin("cam", false)) { p.putChar("bri", (int8_t)v); p.end(); }
+    /* 不在 keyTask 里直接写传感器（传感器归 displayTask 的相机循环管）：
+     * 相机循环每帧比对档位，变了才调 apply_soft_config；拍照 reinit 后
+     * 也会由 apply_soft_config 带过去 */
+    Serial.printf("[CAM] 数字亮度 → %+d\n", s_bri);
+}
+
+/* ±2 循环：+2 再 +1 回到 -2，避免"按到头卡住" */
+int camera_app_brightness_adjust(int delta)
+{
+    int n = s_bri + delta;
+    if (n > CAM_BRI_MAX) n = CAM_BRI_MIN;
+    if (n < CAM_BRI_MIN) n = CAM_BRI_MAX;
+    camera_app_brightness_set(n);
+    return s_bri;
 }
 
 int camera_app_photo_size_get(void) { return s_pszIdx; }
@@ -140,6 +214,16 @@ const char* camera_app_photo_wb_text(int idx)
     return (idx >= 0 && idx < CAM_WB_COUNT) ? kWbText[idx] : "-";
 }
 
+void camera_app_settle_ms_set(uint32_t ms)
+{
+    if (ms < 300)   ms = 300;
+    if (ms > 6000)  ms = 6000;
+    s_settleMs = ms;
+    Serial.printf("[CAM] 拍照收敛预算 → %ums\n", (unsigned)ms);
+}
+
+uint32_t camera_app_settle_ms_get(void) { return s_settleMs; }
+
 /* =====================================================================
  * 官方 cameraTask_InitCameraConfig —— 回退用预览配置（RGB565 QVGA）
  * 仅在传感器在线切换失败时使用（官方 deinit 流程的恢复配置）
@@ -170,6 +254,7 @@ static void InitCameraConfig(void)
     config.jpeg_quality = 12;                /* 仅拍照 JPEG 时生效，RGB565 预览忽略此值 */
     config.fb_count     = 2;                 /* 官方 2 缓冲：RGB565 QVGA 帧约 150KB，2 缓冲足够流畅 */
     config.fb_location  = CAMERA_FB_IN_PSRAM;
+    config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;   /* 预览：保持官方行为 */
 }
 
 /* =====================================================================
@@ -205,6 +290,9 @@ static void InitPicConfig(framesize_t fs = FRAMESIZE_QSXGA)
     config.jpeg_quality = 12;
     config.fb_count     = 2;                 /* 2 缓冲：预览流畅 + 停任务瞬间容错 1 帧滞留 */
     config.fb_location  = CAMERA_FB_IN_PSRAM;
+    /* [成片偏暗根因] WHEN_EMPTY 下队列里永远压着一帧旧曝光的帧，fb_get 立刻
+     * 返回它（实测耗时 1ms），拿到的不是"当前"画面。拍照要最新帧 → LATEST */
+    config.grab_mode    = CAMERA_GRAB_LATEST;
 }
 
 /* =====================================================================
@@ -228,6 +316,7 @@ void camera_app_apply_soft_config(void)
     sensor->set_lenc(sensor, 1);
 
     /* ---- 缺陷校正 / gamma / 动态范围（画质底子） ---- */
+    sensor->set_brightness(sensor, s_bri);  /* 数字亮度偏移：补偿 JPEG 通路偏暗 */
     sensor->set_bpc(sensor, 1);        /* 黑点校正 */
     sensor->set_wpc(sensor, 1);        /* 白点校正 */
     sensor->set_raw_gma(sensor, 1);    /* 传感器 gamma 曲线 */
@@ -261,7 +350,9 @@ void camera_app_apply_soft_config(void)
     /* 限制自动增益上限：默认会一路拉满产生密集彩色噪点；
      * 16X 上限换取更干净的暗部（代价：极暗场景画面会略暗） */
     sensor->set_gainceiling(sensor, GAINCEILING_16X);
-    sensor->set_ae_level(sensor, 0);     /* AE 目标默认（强光下由 aec2 压过曝） */
+    /* AE 目标回到中性：实测 set_ae_level ±2 对 JPEG 成片几乎无影响
+     * （真正有效的是上面的 set_brightness） */
+    sensor->set_ae_level(sensor, 0);
 }
 
 /* =====================================================================
@@ -292,10 +383,14 @@ void camera_app_settle_awb(uint8_t frames)
  *   小分辨率帧率高（HD ~8fps）→ 900ms 能丢 7 帧，够收敛；
  *   大分辨率帧率极低（UXGA 每帧 >1s）→ 只靠时间预算，不硬等帧数。
  * =================================================================== */
+/* 拍照前 AE/AWB 收敛预算（ms，可用串口 setl N 调整，便于实测）
+ * [为什么需要这么多] 拍照要 deinit → 以 JPEG 大分辨率重 init，AE 从默认
+ * 曝光重新爬升；丢帧不够就直接抓帧，成片会比实时预览暗 1 EV 以上
+ * （实测预览 Y≈102 / 成片 Y≈47），也就是"看着和肉眼看不一样"的主因之一 */
 static void photo_settle_ae_awb(framesize_t fs)
 {
-    uint32_t budget = (fs >= FRAMESIZE_UXGA) ? 1400 : 900;
-    uint8_t  maxDrop = (fs >= FRAMESIZE_UXGA) ? 3 : 10;
+    uint32_t budget = (fs >= FRAMESIZE_UXGA) ? (s_settleMs * 3 / 2) : s_settleMs;
+    uint8_t  maxDrop = 40;                   /* 上限放宽，由时间预算控制 */
     uint32_t t0 = millis();
     uint8_t n = 0;
     while (n < maxDrop && millis() - t0 < budget) {
@@ -305,8 +400,12 @@ static void photo_settle_ae_awb(framesize_t fs)
         ++n;
         vTaskDelay(pdMS_TO_TICKS(15));
     }
-    Serial.printf("[PHOTO] AWB/AEC 收敛：丢 %u 帧 / %ums\n",
-                  (unsigned)n, (unsigned)(millis() - t0));
+    /* [关键] 收尾再取一帧并丢弃：fb_count=2 时队列里永远压着一帧
+     * 上一轮曝光状态的旧帧，直接 fb_get 拿到的就是它（实测耗时 1ms） */
+    camera_fb_t* last = esp_camera_fb_get();
+    if (last) esp_camera_fb_return(last);
+    Serial.printf("[PHOTO] AWB/AEC 收敛：丢 %u 帧 / %ums（预算 %ums）\n",
+                  (unsigned)n, (unsigned)(millis() - t0), (unsigned)budget);
 }
 
 /* =====================================================================
@@ -719,6 +818,8 @@ bool camera_app_photo_save(String* photoPath)
     if (ok) {
         Serial.println("[PHOTO] 保存成功（SD 写入后台进行中）");
         lcd_app_mark_gallery_dirty();
+        s_lastShotSeq++;                 /* 相机循环据此弹出成片缩略确认 */
+        s_lastShotPath = path;
     }
     web_app_stream_hold(false);          /* 恢复网页取景流 */
     /* 耗时统计：前台不再包含 SD 写入（后台执行） */
