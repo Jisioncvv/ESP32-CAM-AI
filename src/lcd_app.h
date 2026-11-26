@@ -38,6 +38,11 @@ void lcd_app_mark_gallery_dirty(void);
 void lcd_app_gallery_debug_dump(void);
 void lcd_app_gallery_debug_shot(void);
 
+/* ---- 诊断：回传相册全屏缓存（= 屏幕上这张照片的像素）
+ * 1/2 横向抽样 160x240，竖向全分辨率（横向细线/黑带能看出来）
+ * 协议：FDBG <w> <h> <len> → base64(RLE: 颜色lo 颜色hi 步数lo 步数hi) → ENDB64 */
+void lcd_app_fullscreen_debug_shot(void);
+
 /* ---- 诊断：把当前复用 Sprite（游戏/设置/备忘 整帧缓冲）回传成 PNG 数据 ----
  * 协议同桌面截图：B64 <len> → base64(RLE: 颜色lo 颜色hi 步数lo 步数hi) → ENDB64
  * 注意：Sprite 内存是按 ST7789 的大端序存的，上位机解码时需字节交换才是人眼所见 */

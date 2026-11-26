@@ -385,10 +385,17 @@ static void kb_draw_key(Drawer& g, int k, bool sel)
     g.fillRect(x, y, w, h, th->bg);          /* 先清底：圆角处不留旧色 */
     g.fillRoundRect(x + 1, y + 1, w - 2, h - 2, 5, bg);
     if (k != 44) g.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 5, th->line);
-    g.setTextColor(fg, bg);
+    /* [字位偏移根因] 旧代码用 drawCentreString(label, x+w/2, y+h/2, 2)：
+     * TFT_eSPI 的这个函数内部强制 TC_DATUM（y 是"文字顶边"而不是中心），
+     * 传 y+h/2 等于把 16px 字模的顶部摆到按键垂直中心 → 整排文字下移
+     * 8px，压到按键下边框上，看起来就是"字和键对不上"。
+     * 改用 MC_DATUM + drawString 才是真正的水平/垂直居中；字模也必须
+     * 显式指定 font2，否则会继承上一个界面留下的字号。 */
+    g.setTextFont(2);
     g.setTextSize(1);
+    g.setTextColor(fg, bg);
     g.setTextDatum(MC_DATUM);
-    g.drawCentreString(kb_key_label(k), x + w / 2, y + h / 2, 2);
+    g.drawString(kb_key_label(k), x + w / 2, y + h / 2);
     g.setTextDatum(TL_DATUM);
 }
 

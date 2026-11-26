@@ -542,6 +542,10 @@ static void serialCmdPoll(void)
                 lcd_app_gallery_debug_dump();
             } else if (cmd == "gshot") {
                 lcd_app_gallery_debug_shot();
+            } else if (cmd == "fshot") {
+                /* 全屏预览缓存回传（1/2 横向抽样 160x240）：核对照片是否被
+                 * 黑带/黑格污染（相册全屏无法用 shot 抓，因为不走 Sprite） */
+                lcd_app_fullscreen_debug_shot();
             } else if (cmd == "appgal") {
                 Serial.println("[CMD] 切换相册 App");
                 g_appMode = MODE_GALLERY;

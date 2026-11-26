@@ -79,19 +79,32 @@ static uint16_t* s_ramTarget = nullptr;  /* 预解码目标缓冲 */
 
 static bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap)
 {
+    /* [越界保护] 解码块必须逐行裁剪后再写缓冲：x+w 超出 320 时，旧版
+     * 直接 memcpy(w*h*2) 会把这一块的右边几列挤到下一行的行首，画面
+     * 表现为"斜切 + 一条条横向错行"，缓存里还会攒下一整片黑缝。 */
     if (s_decodeToRam && s_ramTarget) {
         /* 预解码模式：写内存缓冲后立即返回，不碰屏幕 */
         for (int row = 0; row < h; ++row) {
-            if (y + row >= 240) break;
-            memcpy(s_ramTarget + (y + row) * 320 + x,
-                   bitmap + row * w, w * 2);
+            int dy = y + row;
+            if (dy >= 240) break;
+            int cw = w;
+            if (x + cw > 320) cw = 320 - x;
+            if (cw <= 0) continue;
+            memcpy(s_ramTarget + dy * 320 + x, bitmap + row * w, cw * 2);
         }
         return true;
     }
     if (y >= tft.height()) return false;
     tft.pushImage(x, y, w, h, bitmap);
     if (s_caching && s_cacheBuf) {
-        memcpy(s_cacheBuf + y * 320 + x, bitmap, w * h * 2);
+        for (int row = 0; row < h; ++row) {
+            int dy = y + row;
+            if (dy >= 240) break;
+            int cw = w;
+            if (x + cw > 320) cw = 320 - x;
+            if (cw <= 0) continue;
+            memcpy(s_cacheBuf + dy * 320 + x, bitmap + row * w, cw * 2);
+        }
     }
     return true;
 }
@@ -146,10 +159,29 @@ void lcd_app_init(void)
 }
 
 /* =====================================================================
- * 开机画面：QQ 风格企鹅（AI 生成的精致图标，96x96 RGB565 固化进固件）
+ * 开机画面：企鹅图标 + 标题 + 进度条（配色全部跟随当前主题）
+ * ---------------------------------------------------------------------
+ * [本次改进] 旧版是硬编码白底 + TFT_NAVY 标题：切到深色主题后，开机
+ *   一瞬间整屏惨白，和桌面/App 的深色风格完全断裂，像换了台机器。
+ *   现在页面底色/文字/强调色都取 g_th，并把原本干等的 3 秒做成
+ *   进度条动画，开机过程有反馈。
  * 图标由 assets/penguin.jpg 转换（assets/convert_penguin.ps1 可重新生成）
  * =================================================================== */
 #include "splash_penguin.h"
+
+#define SPLASH_TITLE "ESP32-CAM"          /* 改这里即可换名字 */
+#define SPLASH_SUB   "FreeRTOS Camera System"
+
+/* 布局常量：splash 与自检页共用同一套几何，切换时画面不跳变 */
+#define SPLASH_ICON_X   112
+#define SPLASH_ICON_Y    24
+#define SPLASH_TITLE_Y  150
+#define SPLASH_INFO_Y   176
+#define SPLASH_BAR_X     50
+#define SPLASH_BAR_Y    200
+#define SPLASH_BAR_W    220
+#define SPLASH_BAR_H      6
+#define SPLASH_HINT_Y   214
 
 /* 绘制企鹅图标（左上角定位） */
 static void draw_penguin_img(int x, int y)
@@ -159,68 +191,118 @@ static void draw_penguin_img(int x, int y)
     tft.setSwapBytes(false);
 }
 
-/* 标题文字（改这里即可换名字） */
-#define SPLASH_TITLE "ESP32-CAM"
-
-static void draw_splash_title(int y)
+/* 图标底板：企鹅素材是白底 JPEG 转出来的，直接贴到深色底上会多出一个
+ * 白方块。统一垫一张"应用图标"式白色圆角卡，两套主题下都像正规图标 */
+static void draw_splash_icon(void)
 {
+    const Theme* th = g_th;
+    int x = SPLASH_ICON_X - 7, y = SPLASH_ICON_Y - 7;
+    tft.fillRoundRect(x, y, PENGUIN_W + 14, PENGUIN_H + 14, 20, TFT_WHITE);
+    tft.drawRoundRect(x, y, PENGUIN_W + 14, PENGUIN_H + 14, 20, th->line);
+    draw_penguin_img(SPLASH_ICON_X, SPLASH_ICON_Y);
+}
+
+/* 进度条：pct = 0..100（轨道恒画满，填充随进度增长） */
+static void draw_splash_bar(int pct)
+{
+    const Theme* th = g_th;
+    tft.fillRoundRect(SPLASH_BAR_X, SPLASH_BAR_Y, SPLASH_BAR_W, SPLASH_BAR_H,
+                      SPLASH_BAR_H / 2, th->surface2);
+    int w = SPLASH_BAR_W * pct / 100;
+    if (w >= SPLASH_BAR_H)
+        tft.fillRoundRect(SPLASH_BAR_X, SPLASH_BAR_Y, w, SPLASH_BAR_H,
+                          SPLASH_BAR_H / 2, th->accent);
+}
+
+/* 页面骨架：主题底色 + 图标 + 标题（splash/自检页共用） */
+static void draw_splash_base(void)
+{
+    const Theme* th = g_th;
+    tft.fillScreen(th->bg);
+    draw_splash_icon();
+
     tft.setTextDatum(MC_DATUM);
-    tft.setTextSize(4);
-    tft.setTextColor(TFT_NAVY, TFT_WHITE);
-    tft.drawString(SPLASH_TITLE, 160, y);
+    tft.setTextFont(4);
     tft.setTextSize(1);
-    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
-    tft.drawString("FreeRTOS Camera System", 160, y + 30);
+    tft.setTextColor(th->text, th->bg);
+    tft.drawString(SPLASH_TITLE, 160, SPLASH_TITLE_Y);
+    tft.setTextDatum(TL_DATUM);
+}
+
+/* 一行小字提示（主题弱化色） */
+static void draw_splash_hint(const char* txt)
+{
+    const Theme* th = g_th;
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(1);
+    tft.setTextSize(1);
+    tft.setTextColor(th->muted, th->bg);
+    tft.drawString(txt, 160, SPLASH_HINT_Y);
     tft.setTextDatum(TL_DATUM);
 }
 
 /* 开机 splash：屏幕点亮即显示，摄像头/SD 初始化期间不再黑屏 */
 static void draw_splash(void)
 {
-    tft.fillScreen(TFT_WHITE);
-    draw_penguin_img(112, 30);        /* 企鹅图标居中偏上 */
-    draw_splash_title(170);
+    const Theme* th = g_th;
+    draw_splash_base();
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(2);
+    tft.setTextSize(1);
+    tft.setTextColor(th->muted, th->bg);
+    tft.drawString(SPLASH_SUB, 160, SPLASH_INFO_Y);
+    tft.setTextDatum(TL_DATUM);
+    draw_splash_bar(0);
+    draw_splash_hint("Booting...");
+}
+
+/* 自检状态小标签：底色取主题 OSD，文字用各模块自己的状态色 */
+static void draw_boot_chip(int x, int y, const char* txt, uint16_t fg)
+{
+    Drawer d{ nullptr, &tft };
+    ui_osd_chip(d, x, y, txt, fg);
 }
 
 void lcd_app_show_boot_screen(bool camOk, bool sdOk)
 {
     if (!g_lcdReady) return;
+    const Theme* th = g_th;
 
-    /* 正规开机流程：企鹅图标居左 + 状态列表居右（信息分区清晰） */
-    tft.fillScreen(TFT_WHITE);
-    draw_penguin_img(25, 60);
+    draw_splash_base();
 
-    /* 中间浅灰分隔线 */
-    tft.fillRect(150, 16, 2, 208, TFT_LIGHTGREY);
+    /* 中间一行状态标签：CAM / SD / WiFi（替代旧版"左图标 + 右列表"的分栏） */
+    char sdTxt[16];
+    snprintf(sdTxt, sizeof(sdTxt), "SD %s", sdOk ? "OK" : "FAIL");
+    const char* wifiTxt = "WiFi OFF";            /* [按需 WiFi] 开机不开热点 */
+    (void)camOk;                                  /* 相机按需启动，只看启动方式 */
 
-    /* 右侧列：标题 → WiFi → 各模块状态 */
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextSize(2);
-    tft.setTextColor(TFT_NAVY, TFT_WHITE);
-    tft.drawString(SPLASH_TITLE, 232, 40);
+    int w1 = ui_osd_width("CAM APP");
+    int w2 = ui_osd_width(sdTxt);
+    int w3 = ui_osd_width(wifiTxt);
+    int gap = 8;
+    int x = (320 - (w1 + w2 + w3 + gap * 2)) / 2;
+    draw_boot_chip(x,             SPLASH_INFO_Y - 3, "CAM APP", th->accent);
+    draw_boot_chip(x + w1 + gap,  SPLASH_INFO_Y - 3, sdTxt,    sdOk ? th->ok : th->danger);
+    draw_boot_chip(x + w1 + w2 + gap * 2, SPLASH_INFO_Y - 3, wifiTxt, th->muted);
 
-    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
-    tft.drawString("WiFi", 232, 78);
-    /* [按需 WiFi] 开机不再自动开热点（设置 App → WiFi Setup 内开启） */
-    tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
-    tft.drawString("OFF (Setup)", 232, 100);
-
-    tft.setTextSize(2);
-    char buf[24];
-    /* 相机为"按需启动"（进相机 App 才初始化），自检页只显示启动方式 */
-    (void)camOk;
-    tft.setTextColor(TFT_BLUE, TFT_WHITE);
-    tft.drawString("CAM : APP", 232, 150);
-    snprintf(buf, sizeof(buf), "SD  : %s", sdOk ? "OK" : "FAIL");
-    tft.setTextColor(sdOk ? TFT_GREEN : TFT_RED, TFT_WHITE);
-    tft.drawString(buf, 232, 178);
-    tft.setTextDatum(TL_DATUM);
-    Serial.println("[LCD] 开机自检：企鹅 splash + 状态页已显示");
+    draw_splash_bar(0);
+    draw_splash_hint("Initializing system...");
+    Serial.println("[LCD] 开机自检：主题化 splash + 状态标签已显示");
 }
 
+/* 自检停留期间跑进度条动画：把原本 3 秒的"黑等"变成有反馈的加载过程
+ * （分步填充，每步只改 220x6 的一小块，不影响后续任务启动时间） */
 void lcd_app_hold_boot_screen(int ms)
 {
-    vTaskDelay(pdMS_TO_TICKS(ms));
+    if (!g_lcdReady) { vTaskDelay(pdMS_TO_TICKS(ms)); return; }
+    const int steps = 48;
+    int stepMs = ms / steps;
+    if (stepMs < 1) stepMs = 1;
+    for (int i = 1; i <= steps; ++i) {
+        draw_splash_bar(i * 100 / steps);
+        vTaskDelay(pdMS_TO_TICKS(stepMs));
+    }
+    draw_splash_hint("Starting...");
 }
 
 void lcd_app_set_saving_popup(bool on)
@@ -316,6 +398,36 @@ static uint8_t pickJpgScale(const String& path)
     return 8;   /* QSXGA 2560 或尺寸读取失败 */
 }
 
+/* 全屏解码几何：先按实际尺寸选缩放，再把解码结果在 320x240 里居中。
+ * [黑带修复 2026-11-26] 旧版固定从 (0,0) 解码：HD 拍照档 1280x720 按
+ * scale=4 只解出 320x180，屏幕下面 60px 就只剩 fillScreen 的纯黑，看着
+ * 像"一条黑带/黑格子"压在照片底下。现在居中，四周留白统一用主题底色。 */
+static void fullJpgGeom(const String& path, uint8_t& sc,
+                        int& ox, int& oy, int& ow, int& oh)
+{
+    sc = pickJpgScale(path);
+    uint16_t sw = 0, sh = 0;
+    if (TJpgDec.getSdJpgSize(&sw, &sh, path) != JDR_OK || sw == 0 || sh == 0) {
+        ox = oy = 0; ow = 320; oh = 240;
+        return;
+    }
+    ow = (int)sw / sc;
+    oh = (int)sh / sc;
+    if (ow <= 0) ow = 320;
+    if (oh <= 0) oh = 240;
+    if (ow > 320) ow = 320;         /* 极宽的图会超出屏幕：钉死在屏幕内 */
+    if (oh > 240) oh = 240;
+    ox = (320 - ow) / 2;
+    oy = (240 - oh) / 2;
+}
+
+/* 整屏缓冲铺色（缓存/预解码缓冲用同一颜色，回贴才和屏幕逐点一致） */
+static void frame_fill(uint16_t* buf, uint16_t c)
+{
+    if (!buf) return;
+    for (int i = 0; i < 320 * 240; ++i) buf[i] = c;
+}
+
 /* =====================================================================
  * 相册：九宫格缩略图页（3x3 每页 9 张，替代文本列表）
  *   链路：photo_Ns.jpg（VGA 小图）→ pickJpgScale → TJpgDec 解码到
@@ -379,19 +491,43 @@ static void grid_decimate(uint16_t* dst, const uint16_t* src, int ow, int oh)
     }
 }
 
-/* JPEG 结尾校验：残图（缺 FF D9）解码会吐马赛克/蓝噪，必须提前拦截 */
+/* JPEG 结尾校验：残图（缺 FF D9）解码会吐马赛克/蓝噪，必须提前拦截。
+ * [误判修复 2026-11-26] 旧版只看"最后 2 字节 == FF D9"：SD 卡按簇写入、
+ * 或者拍照小图还在后台落盘时，文件尾部会带一段 0x00 填充，EOI 明明在，
+ * 却被判成残图 → 这一格缩略图直接变成纯黑方块（相册里"黑色格子"）。
+ * 现在回扫尾部 1KB 找最后一个 FF D9：JPEG 熵编码里 0xFF 后面必定跟 0x00，
+ * 所以 FF D9 只可能是真 EOI，不会误判。 */
 static bool jpeg_tail_ok(const String& path)
 {
     File f = SD.open(path, FILE_READ);
     if (!f) return false;
     size_t sz = f.size();
     bool ok = false;
-    if (sz >= 4 && f.seek(sz - 2)) {
-        int a = f.read(), b = f.read();
-        ok = (a == 0xFF && b == 0xD9);
+    if (sz >= 4) {
+        uint8_t tail[512];
+        size_t win  = (sz < sizeof(tail)) ? sz : sizeof(tail);
+        size_t base = sz - win;
+        if (f.seek(base)) {
+            size_t rd = f.read(tail, win);
+            for (int i = (int)rd - 2; i >= 0; --i) {
+                if (tail[i] == 0xFF && tail[i + 1] == 0xD9) { ok = true; break; }
+            }
+        }
     }
     f.close();
     return ok;
+}
+
+/* 缩略图占位块：解码失败/被跳过时用主题灰块，而不是 memset(0) 的纯黑。
+ * [黑色网格根因之一] 深色主题下，一格纯黑和"黑屏"没区别，几格连起来
+ * 就是一片黑色网格盖在相册上；改成 surface + 一条灰色短横线，一眼能看懂
+ * 是"这张没有预览"而不是"屏幕坏了" */
+static void grid_placeholder(uint16_t* dst)
+{
+    const Theme* th = g_th;
+    for (int i = 0; i < TH_W * TH_H; ++i) dst[i] = th->surface;
+    int y = TH_H / 2;
+    for (int x = TH_W / 2 - 12; x < TH_W / 2 + 12; ++x) dst[y * TH_W + x] = th->line;
 }
 
 /* 解码一张图 → 102x68 缩略图写进 dst；返回是否成功 */
@@ -425,17 +561,32 @@ static bool grid_decode_one(const String& path, uint16_t* dst)
     return ok;
 }
 
-/* 解码窗口内第 k 格（k=0..8）的缩略图进缓存（失败置黑） */
+/* 解码窗口内第 k 格（k=0..8）的缩略图进缓存（失败画占位块，绝不留黑格） */
 static void grid_load_thumb(int topIdx, int k)
 {
     int listIdx = topIdx + k;
     uint16_t* dst = s_gridBuf + k * TH_W * TH_H;
-    if (listIdx >= s_count || !s_nextBuf) { memset(dst, 0, TH_W * TH_H * 2); return; }
+    if (listIdx >= s_count || !s_nextBuf) { grid_placeholder(dst); return; }
 
     /* 优先小图（秒开）；小图残缺/解码失败 → 回退大图，避免黑格与马赛克 */
     if (grid_decode_one(galleryImagePath(listIdx), dst)) return;
     if (s_small[listIdx] && grid_decode_one("/" + s_names[listIdx], dst)) return;
-    memset(dst, 0, TH_W * TH_H * 2);
+    grid_placeholder(dst);
+}
+
+/* 待解码占位（快速滚动时先铺，松手后由 grid_flush_pending 补齐）
+ * 小圆点用强调色：深色主题下 surface2 本来就偏暗，若再用灰点，一片格子
+ * 看起来就是"黑色方块"；强调色一眼能读成"正在解码" */
+static void grid_draw_pending(int cx, int cy)
+{
+    const Theme* th = g_th;
+    tft.fillRect(cx, cy, TH_W, TH_H, th->surface2);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(1);
+    tft.setTextSize(1);
+    tft.setTextColor(th->accent, th->surface2);
+    tft.drawString("...", cx + TH_W / 2, cy + TH_H / 2);
+    tft.setTextDatum(TL_DATUM);
 }
 
 /* 选中框（设备端统一风格：蓝色圆角细框，与桌面/设置同色） */
@@ -611,7 +762,7 @@ static void galleryGridPage(void)
             if (newTop + k >= s_count)
                 tft.fillRect(cx, cy, TH_W, TH_H, g_th->bg);
             else if (s_gridPendMask & (1u << k))
-                tft.fillRect(cx, cy, TH_W, TH_H, g_th->surface2);   /* 待解码：占位块 */
+                grid_draw_pending(cx, cy);          /* 待解码：灰色占位块（非纯黑） */
             else
                 tft.pushImage(cx, cy, TH_W, TH_H, s_gridBuf + k * TH_W * TH_H);
         }
@@ -681,10 +832,12 @@ static void galleryGridPage(void)
             int cy = GRID_TOP + (k / GRID_COLS) * CELL_H + 1;
             tft.fillRect(cx, cy, TH_W, TH_H, g_th->surface2);
             tft.setTextDatum(MC_DATUM);
-            tft.setTextFont(1);
+            tft.setTextFont(2);
             tft.setTextSize(1);
             tft.setTextColor(g_th->muted, g_th->surface2);
-            tft.drawCentreString(s_names[newTop + k], cx + TH_W / 2, cy + TH_H / 2, 2);
+            /* MC_DATUM + drawString：drawCentreString 是 TC_DATUM，会把
+             * y 当顶边，文字整块往下坠，这里统一改掉 */
+            tft.drawString(s_names[newTop + k], cx + TH_W / 2, cy + TH_H / 2);
             tft.setTextDatum(TL_DATUM);
         }
     }
@@ -758,7 +911,10 @@ void lcd_app_gallery_debug_shot(void)
     }
 
     Serial.printf("B64 %u\n", (unsigned)rl);
-    static uint8_t rbuf[1024];
+    /* [分块必须 3 字节对齐] 1024 不是 3 的倍数，每块 base64 都带 "=" 填充，
+     * 上位机 b64decode 会在第一个 '=' 处截断，只解出第一块（1KB）。
+     * 1002 = 3 * 334，除最后一块外都不产生填充。 */
+    static uint8_t rbuf[1002];
     static char bbuf[1400];
     size_t sent = 0;
     while (sent < rl) {
@@ -774,6 +930,57 @@ void lcd_app_gallery_debug_shot(void)
         sent += n;
     }
     Serial.println("ENDB64");
+}
+
+/* 诊断：把相册全屏缓存回传（屏幕上的照片像素）
+ * 1/2 横向抽样 = 160x240：竖向保持全分辨率，"黑色横线/黑带"一眼可见；
+ * 数据量减半，串口 115200 也能几秒传完。 */
+void lcd_app_fullscreen_debug_shot(void)
+{
+    if (!s_cacheBuf) { Serial.println("[FDBG] no cache buf"); return; }
+    const int W = 160, H = 240;                 /* 源 320x240，横向隔点取 */
+    static uint8_t* rle = nullptr;
+    if (!rle) rle = (uint8_t*)heap_caps_malloc(W * H * 4 + 16, MALLOC_CAP_SPIRAM);
+    if (!rle) { Serial.println("[FDBG] alloc fail"); return; }
+
+    size_t rl = 0;
+    int i = 0;
+    while (i < W * H) {
+        int sx = (i % W) * 2, sy = i / W;
+        uint16_t c = s_cacheBuf[sy * 320 + sx];
+        int run = 1;
+        while (i + run < W * H && run < 60000) {
+            int nx = ((i + run) % W) * 2, ny = (i + run) / W;
+            if (s_cacheBuf[ny * 320 + nx] != c) break;
+            ++run;
+        }
+        rle[rl++] = c & 0xFF; rle[rl++] = c >> 8;
+        rle[rl++] = run & 0xFF; rle[rl++] = run >> 8;
+        i += run;
+    }
+
+    Serial.printf("FDBG %d %d %u\n", W, H, (unsigned)rl);
+    /* base64 分块必须是 3 的倍数（1002 = 3x334），否则每块末尾的 '=' 会让
+     * 上位机把后续数据当成填充截掉 */
+    static uint8_t rbuf[1002];
+    static char bbuf[1400];
+    size_t sent = 0;
+    while (sent < rl) {
+        size_t n = (sent + sizeof(rbuf) > rl) ? (rl - sent) : sizeof(rbuf);
+        memcpy(rbuf, rle + sent, n);
+        size_t olen = 0;
+        if (mbedtls_base64_encode((unsigned char*)bbuf, sizeof(bbuf), &olen, rbuf, n) != 0)
+            break;
+        bbuf[olen] = '\0';
+        Serial.println(bbuf);
+        Serial.flush();
+        vTaskDelay(1);
+        sent += n;
+    }
+    Serial.println("ENDB64");
+    Serial.printf("[FDBG] 全屏缓存已回传（idx=%d name=%s）\n",
+                  s_cacheIdx, (s_cacheIdx >= 0 && s_cacheIdx < s_count)
+                                  ? s_names[s_cacheIdx].c_str() : "-");
 }
 
 /* 诊断：把复用 Sprite（游戏/设置/备忘 的整帧缓冲）RLE+Base64 回传 */
@@ -866,6 +1073,27 @@ static void gallery_info_tick(void)
     tft.setSwapBytes(false);
 }
 
+/* 残图提示页：SD 上的 JPEG 被截断（掉电/写卡中断）时，TJpgDec 只能解出
+ * 前半部分，其余 MCU 块整块是黑的 —— 屏幕上就是"一大片黑色小方格"。
+ * 与其把这种图当照片显示，不如明确告诉用户文件坏了。 */
+static void gallery_show_broken(int listIdx)
+{
+    const Theme* th = g_th;
+    tft.fillScreen(th->bg);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(2);
+    tft.setTextSize(1);
+    tft.setTextColor(th->danger, th->bg);
+    tft.drawString("Image file damaged", 160, 100);
+    tft.setTextFont(1);
+    tft.setTextColor(th->muted, th->bg);
+    tft.drawString(s_names[listIdx] + "  (" + (listIdx + 1) + "/" + s_count + ")",
+                   160, 126);
+    tft.drawString("2xCAM = delete", 160, 148);
+    tft.setTextDatum(TL_DATUM);
+    Serial.printf("[GAL] 图片残缺，已给提示页: %s\n", s_names[listIdx].c_str());
+}
+
 /* =====================================================================
  * 相册：全屏查看（三级加速）
  *   1. 当前图缓存命中   → 25ms 推屏（秒开）
@@ -899,26 +1127,41 @@ static void galleryFullscreen(int listIdx)
         }
     } else {
         /* ---- 级别3：全图解码 + 写入当前缓存 ----
-         * 自适应 scale：VGA 小图 ~200ms，QSXGA 大图 ~1s+ */
+         * 自适应 scale + 居中：VGA 小图 ~200ms，QSXGA 大图 ~1s+ */
         String path = galleryImagePath(listIdx);
-        TJpgDec.setJpgScale(pickJpgScale(path));
+        /* [黑格根因] 残图（缺 EOI）解码不报错，只是后半段 MCU 块全黑，
+         * 屏幕上一片黑色小方格。先校验再解码 */
+        if (!jpeg_tail_ok(path)) {
+            s_cacheIdx = -1;
+            gallery_show_broken(listIdx);
+            gallery_show_info(listIdx);
+            return;
+        }
+        uint8_t sc; int ox, oy, ow, oh;
+        fullJpgGeom(path, sc, ox, oy, ow, oh);
+        TJpgDec.setJpgScale(sc);
         TJpgDec.setCallback(tft_output);
-        tft.setSwapBytes(true);
 
-        tft.fillScreen(TFT_BLACK);
+        /* 底色先铺满，再居中解码：缓存与屏幕用同一个颜色，回贴才安全
+         * （旧版 memset 全黑 + 从 0,0 开始解码 → 下方留一条纯黑带） */
+        uint16_t lb = g_th->bg;
+        tft.setSwapBytes(true);
+        tft.fillScreen(lb);
+        frame_fill(s_cacheBuf, lb);
+
         tft.setCursor(5, 110);
         tft.setTextFont(1);
         tft.setTextSize(2);
-        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+        tft.setTextColor(g_th->muted, lb);
         tft.print("Loading...");
 
         s_caching  = (s_cacheBuf != nullptr);
         s_cacheIdx = listIdx;
-        /* 解码前把缓存清零：图片若不足 320x240（16:9 等），没被写到的区域
-         * 保持黑色，与屏幕 fillScreen 一致 → 缓存永远等于屏幕，回贴才安全 */
-        if (s_cacheBuf) memset(s_cacheBuf, 0, 320 * 240 * 2);
-        TJpgDec.drawSdJpg(0, 0, path);
+        TJpgDec.drawSdJpg(ox, oy, path);
         s_caching = false;
+        /* [收尾] 旧版这里漏了复位：解码后 swapBytes 一直是 true，退出相册
+         * 后其它 App 的 pushImage 会被误换字节（整屏颜色错乱） */
+        tft.setSwapBytes(false);
 
         /* 解码回调已逐块上屏，画面完整，无需再次推屏 */
     }
@@ -951,11 +1194,24 @@ static void galleryPrefetchStep(void)
     s_prefetchBusy = true;
     s_nextIdx = -1;
     String path = galleryImagePath(s_prefetchTarget);
-    TJpgDec.setJpgScale(pickJpgScale(path));
+    /* 残图不预解码：解出来也只有一堆黑块，翻页时反而要整屏推一遍 */
+    if (!jpeg_tail_ok(path)) {
+        s_prefetchReq  = false;
+        s_prefetchBusy = false;
+        Serial.printf("[GAL] 预解码跳过残图 %s\n", s_names[s_prefetchTarget].c_str());
+        return;
+    }
+    uint8_t sc; int ox, oy, ow, oh;
+    fullJpgGeom(path, sc, ox, oy, ow, oh);
+    TJpgDec.setJpgScale(sc);
     TJpgDec.setCallback(tft_output);
+    /* [残影修复] 预解码缓冲必须先铺满底色：1280x720 只解出 320x180，
+     * 旧代码不清缓冲，下面 60 行留着上一张的像素，翻页整屏推出去就是
+     * 一条莫名其妙的花带/黑格 */
+    frame_fill(s_nextBuf, g_th->bg);
     s_decodeToRam = true;
     s_ramTarget   = s_nextBuf;
-    TJpgDec.drawSdJpg(0, 0, path);
+    TJpgDec.drawSdJpg(ox, oy, path);
     s_decodeToRam = false;
     s_ramTarget   = nullptr;
     s_nextIdx = s_prefetchTarget;   /* 预解码完成，翻页即可命中 */
